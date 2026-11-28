@@ -457,18 +457,26 @@ pub mod credits {
 /// [`effective_half_life_ms`] 의 조절 폭
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct AdaptiveHalfLifeCfg {
-    /// 패치 드리프트로 보는 z (기본 2.0)
+    /// 패치 드리프트로 보는 `|z|` (기본 2.0)
     pub drift_z_trigger: f64,
+    /// 드리프트 기울기 γ: `H / (1 + γ(|z| − trigger))` (기본 1.0)
+    #[serde(default = "unit_gamma")]
+    pub drift_gamma: f64,
     /// 드리프트 때 줄일 수 있는 가장 짧은 반감기 (기본 2일)
     pub min_drift_half_life_ms: f64,
     /// 스코프 전체가 쉬는 동안(월간 · 분기 업무) 늘일 수 있는 가장 긴 반감기 (기본 45일)
     pub max_dormant_half_life_ms: f64,
 }
 
+fn unit_gamma() -> f64 {
+    1.0
+}
+
 impl Default for AdaptiveHalfLifeCfg {
     fn default() -> Self {
         AdaptiveHalfLifeCfg {
             drift_z_trigger: 2.0,
+            drift_gamma: 1.0,
             min_drift_half_life_ms: 2.0 * DAY_MS,
             max_dormant_half_life_ms: 45.0 * DAY_MS,
         }
@@ -478,8 +486,8 @@ impl Default for AdaptiveHalfLifeCfg {
 /// 트래픽 · 드리프트에 맞춘 유효 반감기 `H_eff`.
 ///
 /// 계약 경로(`verdict_v1` · `v2`)는 트랙의 `half_life_ms` 를 그대로 쓰고, 서버 nav_verdicts 스윕과 로컬 코칭이 골라 부른다.
-/// - 드리프트 `z ≥ drift_z_trigger`: `H × 1 / (1 + (z − trigger))`, 단 `min_drift_half_life_ms` 아래로는 줄이지 않는다
-///   (기본 반감기가 그보다 짧으면 기본값). 옛 코스를 빨리 내린다.
+/// - 드리프트 `|z| ≥ drift_z_trigger`(어느 쪽으로 꺾여도): `H / (1 + γ(|z| − trigger))`, 단 `min_drift_half_life_ms` 아래로는
+///   줄이지 않는다(기본 반감기가 그보다 짧으면 기본값). 표가 아래로 꺾인 옛 premium 을 빨리 내린다.
 /// - 그 밖: 스코프 활성 비율 `a`(0 = 완전 휴지 ~ 1 = 상시 활성)만큼 `H + (H_max − H)(1 − a)` 로 늘인다. 월간 업무의
 ///   휴지기에 코스가 잊히지 않게 한다. 기본 반감기가 이미 `H_max` 이상이면(예: 90일 `pd` 트랙) 늘이지도 줄이지도 않는다.
 /// - 유한하지 않은 `z` 는 드리프트 없음, 유한하지 않은 `a` 는 상시 활성(조절 없음)으로 본다.
@@ -492,9 +500,10 @@ pub fn effective_half_life_ms(
     if !base_half_life_ms.is_finite() || base_half_life_ms <= 0.0 {
         return base_half_life_ms;
     }
-    if let Some(dz) = drift_z.filter(|z| z.is_finite() && *z >= cfg.drift_z_trigger) {
-        let shrink = 1.0 / (1.0 + (dz - cfg.drift_z_trigger));
-        return (base_half_life_ms * shrink).max(cfg.min_drift_half_life_ms.min(base_half_life_ms));
+    if let Some(dz) = drift_z.map(f64::abs).filter(|z| z.is_finite() && *z >= cfg.drift_z_trigger) {
+        // 나눗셈 그대로 (서버 스윕의 예전 식과 비트까지 같다)
+        let divisor = 1.0 + cfg.drift_gamma.max(0.0) * (dz - cfg.drift_z_trigger);
+        return (base_half_life_ms / divisor).max(cfg.min_drift_half_life_ms.min(base_half_life_ms));
     }
     let act = if scope_activity_ratio.is_finite() {
         scope_activity_ratio.clamp(0.0, 1.0)
@@ -697,6 +706,13 @@ mod tests {
         assert_eq!(effective_half_life_ms(h, Some(50.0), 1.0, &cfg), 2.0 * day);
         // 기준 z 아래 드리프트는 휴지 규칙을 따른다
         assert_eq!(effective_half_life_ms(h, Some(1.9), 0.0, &cfg), 45.0 * day);
+        // 아래로 꺾인 드리프트도 줄인다 (낡은 premium 의 강등)
+        assert_eq!(effective_half_life_ms(h, Some(-3.0), 1.0, &cfg), 7.0 * day);
+        // 기울기: 서버 nav 스윕의 매개변수(기준 1.5, γ 1.2)는 H / (1 + 1.2 · (|z| − 1.5))
+        let nav = AdaptiveHalfLifeCfg { drift_z_trigger: 1.5, drift_gamma: 1.2, ..cfg };
+        assert!((effective_half_life_ms(h, Some(-2.5), 1.0, &nav) - h / 2.2).abs() < 1e-6);
+        let old: AdaptiveHalfLifeCfg = serde_json::from_str(r#"{"drift_z_trigger":2.0,"min_drift_half_life_ms":1.0,"max_dormant_half_life_ms":2.0}"#).unwrap();
+        assert_eq!(old.drift_gamma, 1.0, "configs written before the slope read with γ = 1");
         // 90일 트랙은 휴지기에 줄지 않는다 (45일 상한은 늘이는 폭일 뿐)
         let pd = 90.0 * day;
         assert_eq!(effective_half_life_ms(pd, None, 0.0, &cfg), pd);
