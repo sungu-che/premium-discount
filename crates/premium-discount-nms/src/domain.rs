@@ -426,6 +426,10 @@ impl<M: Clone> BiasedTieredBank<M> {
         &self.entries[idx]
     }
 
+    pub fn config(&self) -> &TieredBankConfig {
+        &self.cfg
+    }
+
     fn score_entry(&self, idx: usize, q_unit: &[f32]) -> f32 {
         let e = &self.entries[idx];
         let bias = e
@@ -629,6 +633,105 @@ impl<M: Clone> BiasedTieredBank<M> {
     }
 }
 
+/// What [`BankBackend::best`] found
+#[derive(Debug, Clone, PartialEq)]
+pub struct BankMatch<M> {
+    pub key: String,
+    pub payload: M,
+    /// [`EXACT_SCORE`] · [`PREFIX_SCORE`] for lexical hits; the cosine score otherwise (calibrated when the backend has
+    /// a scale)
+    pub score: f32,
+    pub hit: Hit,
+    /// Passed the backend's own gate. [`BankBackend::Full`] has none (always `true`; callers keep their `accept`);
+    /// [`BankBackend::BiasedTiered`] uses the tiered floor and margin.
+    pub accepted: bool,
+    /// Won from an inactive sector's cold tier
+    pub rescued_from_cold: bool,
+}
+
+/// One scoring interface over the plain bank and the sector-tiered bank, so a caller switches backends without
+/// changing what it stores or sends.
+pub enum BankBackend<M, E: TextEmbedder> {
+    /// Exact / agglutinative-prefix hits, then the best bias − prejudice cosine over every entry
+    Full(DomainBank<M, E>),
+    /// Exact / prefix hits on `lexical` (0.95 / 0.90 as before), then the sector-tiered cosine stage on `tiered`
+    /// (active sector + priority-pinned entries at full precision, inactive sectors behind the cold-cluster guard)
+    BiasedTiered {
+        lexical: DomainBank<M, E>,
+        tiered: BiasedTieredBank<M>,
+        /// `Some(knots)`: tiered scores are reported on the calibrated scale
+        /// ([`calibrate_knots`](premium_discount_sds::knots::calibrate_knots)) and the tiered `abs_floor` /
+        /// `margin_high` are read on that scale. Pruning inside the tiered bank stays on raw cosines.
+        scale_knots: Option<&'static [(f32, f32)]>,
+    },
+}
+
+impl<M: Clone, E: TextEmbedder> BankBackend<M, E> {
+    /// The lexical bank (exact / prefix matching, function words, the embedder)
+    pub fn lexical(&self) -> &DomainBank<M, E> {
+        match self {
+            BankBackend::Full(bank) => bank,
+            BankBackend::BiasedTiered { lexical, .. } => lexical,
+        }
+    }
+
+    /// The best entry for a span, `None` when the span has no content word (or the tiered stage finds none).
+    /// `active_sector` is ignored by [`BankBackend::Full`].
+    pub fn best(&self, words: &[Word], active_sector: u32) -> Option<BankMatch<M>> {
+        match self {
+            BankBackend::Full(bank) => {
+                let s = bank.best(words)?;
+                let e = bank.entry(s.index);
+                Some(BankMatch {
+                    key: e.key.clone(),
+                    payload: e.payload.clone(),
+                    score: s.score,
+                    hit: s.hit,
+                    accepted: true,
+                    rescued_from_cold: false,
+                })
+            }
+            BankBackend::BiasedTiered { lexical, tiered, scale_knots } => {
+                if !lexical.eligible(words) {
+                    return None;
+                }
+                if let Some((i, hit)) = lexical.exact(words) {
+                    let e = lexical.entry(i);
+                    return Some(BankMatch {
+                        key: e.key.clone(),
+                        payload: e.payload.clone(),
+                        score: if hit == Hit::Exact { EXACT_SCORE } else { PREFIX_SCORE },
+                        hit,
+                        accepted: true,
+                        rescued_from_cold: false,
+                    });
+                }
+                let q = lexical.embedder.embed(&DomainBank::<M, E>::span_text(words));
+                let out = tiered.match_query(&q, active_sector);
+                let idx = out.best_index?;
+                let (score, accepted) = match scale_knots {
+                    None => (out.best_score, out.accepted),
+                    Some(k) => {
+                        use premium_discount_sds::knots::calibrate_knots;
+                        let (s1, s2) = (calibrate_knots(out.best_score, k), calibrate_knots(out.second_score, k));
+                        let cfg = tiered.config();
+                        (s1, s1 >= cfg.abs_floor && s1 - s2 >= cfg.margin_high)
+                    }
+                };
+                let e = tiered.entry(idx);
+                Some(BankMatch {
+                    key: e.key.clone(),
+                    payload: e.payload.clone(),
+                    score,
+                    hit: Hit::Vector,
+                    accepted,
+                    rescued_from_cold: out.rescued_from_cold,
+                })
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,5 +870,53 @@ mod tests {
         assert_eq!(r_cold.best_index, Some(3));
         assert!(r_cold.rescued_from_cold);
         assert_eq!(r_cold.cold_entries_scored, 1);
+    }
+
+    /// Calibrated scale that halves positive scores (raw 1.0 → 0.5)
+    static HALF: [(f32, f32); 3] = [(-1.0, -1.0), (0.0, 0.0), (1.0, 0.5)];
+
+    fn tiered_of(lexical: &DomainBank<Act, HashedNgramEmbedder>, sectors: &[u32]) -> BiasedTieredBank<Act> {
+        let phrases: [&[&str]; 3] = [&["앱 꺼 줘", "종료해 줘"], &["이겼다", "클리어했다"], &["주가 떨어졌어"]];
+        let entries = (0..lexical.len())
+            .map(|i| {
+                let e = lexical.entry(i);
+                TieredEntry {
+                    key: e.key.clone(),
+                    sector: sectors[i],
+                    priority_pinned: false,
+                    payload: e.payload,
+                    bias_unit: phrases[i].iter().map(|p| (lexical.embedder.embed(&DomainBank::<Act, HashedNgramEmbedder>::span_text(&normalize(p).words)), 1.0)).collect(),
+                    prej_unit: vec![],
+                }
+            })
+            .collect();
+        BiasedTieredBank::new(lexical.embedder.dim, entries, TieredBankConfig::default())
+    }
+
+    #[test]
+    fn bank_backend_switches_full_and_tiered_without_changing_lexical_hits() {
+        let full = BankBackend::Full(bank());
+        let tiered = BankBackend::BiasedTiered { tiered: tiered_of(&bank(), &[0, 1, 2]), lexical: bank(), scale_knots: None };
+        let w = |t: &str| normalize(t).words;
+        // exact / prefix hits are the lexical bank's in both backends
+        for b in [&full, &tiered] {
+            let m = b.best(&w("종료해 줘"), 1).unwrap();
+            assert_eq!((m.key.as_str(), m.hit, m.score, m.payload), ("system.exit", Hit::Exact, EXACT_SCORE, Act::Quit));
+            assert_eq!(b.best(&w("클리어했다"), 0).unwrap().hit, Hit::Prefix);
+            assert!(b.best(&w("해 줘 좀"), 0).is_none(), "function words alone name nothing");
+        }
+        // a vector query: the full bank scores every entry; the tiered bank rescues it from a cold sector
+        let q = w("주가 떨어졌네");
+        let f = full.best(&q, 0).unwrap();
+        let t = tiered.best(&q, 0).unwrap();
+        assert_eq!((f.key.as_str(), f.hit), ("market.down", Hit::Vector));
+        assert_eq!((t.key.as_str(), t.hit, t.rescued_from_cold, t.accepted), ("market.down", Hit::Vector, true, true), "{t:?}");
+        assert!((t.score - f.score).abs() < 1e-5, "same cosine, two backends: {} vs {}", t.score, f.score);
+        // with a scale, the score is calibrated and the tiered floor is read on that scale
+        let scaled = BankBackend::BiasedTiered { tiered: tiered_of(&bank(), &[0, 1, 2]), lexical: bank(), scale_knots: Some(&HALF) };
+        let s = scaled.best(&q, 0).unwrap();
+        assert!((s.score - t.score * 0.5).abs() < 1e-5);
+        assert_eq!(s.accepted, s.score >= TieredBankConfig::default().abs_floor);
+        assert_eq!(scaled.lexical().len(), 3);
     }
 }

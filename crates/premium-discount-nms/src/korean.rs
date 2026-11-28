@@ -10,6 +10,17 @@ pub const NOMINAL_TAILS: &[&str] = &[
     "한테", "에게", "랑", "이랑", "까지", "부터",
 ];
 
+/// Demonstratives and position words that point at one place on a screen or in a table before a one-syllable noun
+/// ("이 칸", "그 줄", "아래 행"). Such a span names something although its content word has a single character.
+pub const DEICTIC_HEADS: &[&str] = &["이", "그", "저", "위", "아래", "옆"];
+/// One-syllable nouns of screen / table positions a demonstrative can point at.
+pub const DEICTIC_SPATIAL_NOUNS: &[&str] = &["칸", "열", "행", "줄", "표", "창", "탭", "값", "키"];
+
+/// `head` is a demonstrative or position word and `noun` (particle peeled: "칸에" → "칸") a one-syllable spatial noun.
+pub fn is_deictic_spatial_pair(head: &str, noun: &str) -> bool {
+    DEICTIC_HEADS.contains(&head) && DEICTIC_SPATIAL_NOUNS.contains(&noun_lemma(noun).as_str())
+}
+
 pub const COPULA_TAILS: &[&str] = &[
     "이고",
     "이며",

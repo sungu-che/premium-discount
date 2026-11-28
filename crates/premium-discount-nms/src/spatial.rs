@@ -182,6 +182,89 @@ pub fn soft_checkpoint_bridge(
         .collect()
 }
 
+/// One cell of a multi-level table addressed by `[row × column × role]`: cells that share a label ("total",
+/// "amount") under different headers get distinct addresses and distinct embedding texts, so requests no longer
+/// tie across them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, serde::Deserialize)]
+pub struct TableCellContext {
+    pub table_title: String,
+    pub row_header: String,
+    pub col_header: String,
+    /// What the cell holds (value, unit, note …); part of the address so a value and its note never collide.
+    pub cell_role: String,
+    /// The text in the cell's own label position.
+    pub raw_label: String,
+}
+
+fn address_part(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+impl TableCellContext {
+    /// Structural key `cell|<row_header>|<col_header>|<role>` (each part trimmed, inner whitespace collapsed, lower case).
+    pub fn address_key(&self) -> String {
+        format!(
+            "cell|{}|{}|{}",
+            address_part(&self.row_header),
+            address_part(&self.col_header),
+            address_part(&self.cell_role)
+        )
+    }
+
+    /// 64-bit FNV-1a of [`address_key`](Self::address_key).
+    pub fn address(&self) -> u64 {
+        crate::embed::fnv1a_64(&self.address_key())
+    }
+
+    /// Embedding input `"{row_header} / {col_header}: {raw_label}"`; empty headers are left out.
+    pub fn embed_text(&self) -> String {
+        let headers: Vec<&str> = [self.row_header.trim(), self.col_header.trim()].into_iter().filter(|h| !h.is_empty()).collect();
+        let label = self.raw_label.trim();
+        match (headers.is_empty(), label.is_empty()) {
+            (true, _) => label.to_string(),
+            (false, true) => headers.join(" / "),
+            (false, false) => format!("{}: {label}", headers.join(" / ")),
+        }
+    }
+}
+
+/// Requests ↔ table cells, one to one, on the cells' 2D context. Each cell is embedded from
+/// [`TableCellContext::embed_text`]; the cosine matrix `[request][cell]` is double-centred
+/// ([`double_center_guarded`](premium_discount_sds::matrix::double_center_guarded)) and assigned with the noise-margin
+/// gate of [`exclusive_assign_adaptive`](premium_discount_sds::matrix::exclusive_assign_adaptive), which holds back any
+/// request whose best cells form a flat tie ([`TieKind::Flat`](premium_discount_sds::TieKind)) instead of guessing.
+/// `margin` is raised to a positive value, so an exact tie never wins by a margin of 0.
+/// Returns per request `(cell index, raw cosine, centred margin)` and the gate's diagnostics.
+pub fn assign_table_cells(
+    requests: &[Vec<f32>],
+    cells: &[TableCellContext],
+    embedder: &dyn crate::embed::TextEmbedder,
+    residual: f32,
+    margin: f32,
+) -> (Vec<Option<(usize, f32, f32)>>, Vec<premium_discount_sds::AssignDiag>) {
+    use premium_discount_sds::matrix::{double_center_guarded, exclusive_assign_adaptive};
+    use premium_discount_sds::TieKind;
+    if requests.is_empty() || cells.is_empty() {
+        return (vec![None; requests.len()], Vec::new());
+    }
+    let texts: Vec<String> = cells.iter().map(TableCellContext::embed_text).collect();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let cell_vecs = embedder.embed_batch(&refs);
+    let raw: Vec<Vec<f32>> = requests
+        .iter()
+        .map(|q| cell_vecs.iter().map(|c| cosine(q, c).max(0.0)).collect())
+        .collect();
+    let centred = double_center_guarded(&raw);
+    let margin = margin.max(1e-6);
+    let (assigned, diags) = exclusive_assign_adaptive(&centred, residual, margin, |_, _, tie| tie != TieKind::Flat);
+    let out = assigned
+        .into_iter()
+        .enumerate()
+        .map(|(i, a)| a.map(|(j, _, m)| (j, raw[i][j], m)))
+        .collect();
+    (out, diags)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +372,63 @@ mod tests {
         ];
         let vis_match = soft_checkpoint_bridge(&g_vis, &l_vis, 0.78, 0.08);
         assert_eq!(vis_match[0].map(|x| x.0), Some(1));
+    }
+
+    fn table_4x5(label: &str, headers: bool) -> Vec<TableCellContext> {
+        let rows = ["row a", "row b", "row c", "row d"];
+        let cols = ["col 1", "col 2", "col 3", "col 4", "col 5"];
+        rows.iter()
+            .flat_map(|r| {
+                cols.iter().map(move |c| TableCellContext {
+                    table_title: "t".into(),
+                    row_header: if headers { r.to_string() } else { String::new() },
+                    col_header: if headers { c.to_string() } else { String::new() },
+                    cell_role: "value".into(),
+                    raw_label: label.into(),
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn twenty_same_label_cells_separate_by_their_headers() {
+        use premium_discount_sds::TieKind;
+        use std::collections::HashSet;
+        let e = HashedNgramEmbedder::default();
+        let cells = table_4x5("total", true);
+        assert_eq!(cells.len(), 20);
+        assert_eq!(cells.iter().map(TableCellContext::address).collect::<HashSet<_>>().len(), 20);
+        assert_eq!(cells[7].address_key(), "cell|row b|col 3|value");
+        assert_eq!(cells[7].embed_text(), "row b / col 3: total");
+        // requests worded from the two headers, half of them in another order
+        let requests: Vec<Vec<f32>> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let text = if i % 2 == 0 {
+                    format!("{} / {}: total", c.row_header, c.col_header)
+                } else {
+                    format!("total in {} under {}", c.row_header, c.col_header)
+                };
+                e.embed(&text)
+            })
+            .collect();
+        let (got, _) = assign_table_cells(&requests, &cells, &e, 0.0, 0.02);
+        let right = got.iter().enumerate().filter(|(i, a)| a.map(|x| x.0) == Some(*i)).count();
+        let wrong = got.iter().enumerate().filter(|(i, a)| a.is_some_and(|x| x.0 != *i)).count();
+        assert_eq!((right, wrong), (20, 0), "{got:?}");
+        // the same cells by label alone: every column alike, every line a flat tie, nothing assigned, nothing wrong
+        let bare = table_4x5("total", false);
+        assert_eq!(bare.iter().map(TableCellContext::address).collect::<HashSet<_>>().len(), 1);
+        let (got_bare, diags) = assign_table_cells(&requests, &bare, &e, 0.0, 0.0);
+        assert!(got_bare.iter().all(Option::is_none), "{got_bare:?}");
+        assert!(diags.iter().all(|d| d.tie == TieKind::Flat && !d.accepted), "{diags:?}");
+        let bare_vec = e.embed(&bare[0].embed_text());
+        let raw: Vec<Vec<f32>> = requests.iter().map(|q| vec![cosine(q, &bare_vec).max(0.0); bare.len()]).collect();
+        let centred = premium_discount_sds::matrix::double_center_guarded(&raw);
+        for line in 0..bare.len() {
+            assert_eq!(premium_discount_sds::matrix::line_tie_shape(&centred, line, -1.0).map(|s| s.0), Some(TieKind::Flat));
+        }
+        assert_eq!(assign_table_cells(&[], &cells, &e, 0.0, 0.02).0.len(), 0);
     }
 }

@@ -148,6 +148,11 @@ impl Default for HashedNgramEmbedder {
     }
 }
 
+/// 64-bit FNV-1a of `s` (structural addresses, entity keys): stable across platforms and builds.
+pub fn fnv1a_64(s: &str) -> u64 {
+    fnv1a(s, 0)
+}
+
 fn fnv1a(s: &str, salt: u8) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64 ^ salt as u64;
     for b in s.bytes() {

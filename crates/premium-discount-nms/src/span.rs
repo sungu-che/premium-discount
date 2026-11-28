@@ -78,6 +78,14 @@ fn content_chars(words: &[Word]) -> usize {
         .sum()
 }
 
+/// A demonstrative pointing at a one-syllable spatial noun ("이 칸", "방금 그 줄"): the span names a place although
+/// its content has one character, so it may still reach the vector stage.
+fn deictic_spatial(words: &[Word]) -> bool {
+    words
+        .windows(2)
+        .any(|w| crate::korean::is_deictic_spatial_pair(&w[0].surface, &w[1].surface))
+}
+
 /// What [`span_assign`] chose, plus the observations SDS keeps.
 #[derive(Debug, Clone, Default)]
 pub struct Assigned {
@@ -454,7 +462,7 @@ pub fn span_assign_with<M: Clone, E: TextEmbedder, L: TextEmbedder>(
     // Exact / prefix hits first; their cells stay out of the vector matrix.
     let mut matrix = vec![vec![premium_discount_sds::matrix::ABSENT; ranges.len()]; bank.len()];
     for (j, scores) in raw.iter().enumerate() {
-        let short = content_chars(spans[j]) < 2;
+        let short = content_chars(spans[j]) < 2 && !deictic_spatial(spans[j]);
         for d in scores {
             if d.hit == Hit::Vector {
                 if !short {
@@ -636,6 +644,37 @@ mod tests {
 
     fn dodge_hit(a: &Assigned, bank: &DomainBank<&'static str, HashedNgramEmbedder>) -> Option<SpanHit> {
         a.hits.iter().find(|h| bank.entry(h.index).key == "coach.dodge").cloned()
+    }
+
+    #[test]
+    fn a_demonstrative_and_a_one_syllable_spatial_noun_reach_the_vector_stage() {
+        let spec = |key: &str, bias: &[&str]| DomainSpec {
+            key: key.into(),
+            payload: "",
+            bias: bias.iter().map(|b| (b.to_string(), 1.0)).collect(),
+            prejudice: vec![],
+            exact: vec![],
+        };
+        let bank = DomainBank::from_specs_content(
+            vec![spec("screen.line", &["그 줄", "이 줄"]), spec("screen.tab", &["옆 탭", "저 탭"])],
+            &["알려 줘".to_string()],
+            HashedNgramEmbedder::default(),
+        );
+        let none = None::<&DomainBank<&str, HashedNgramEmbedder>>;
+        let assign = |text: &str| {
+            let mut n = normalize(text);
+            RuleAnalyzer.analyze(&mut n);
+            (span_assign(&n.words, &bank, none, &cfg(), |_, _, _| false), n.words)
+        };
+        let (a, words) = assign("그 줄");
+        assert!(!words[0].is_content(), "the demonstrative is a function word: {words:?}");
+        assert!(a.hits.iter().any(|h| bank.entry(h.index).key == "screen.line"), "{a:?}");
+        let (b, _) = assign("옆 탭에");
+        assert!(b.hits.iter().any(|h| bank.entry(h.index).key == "screen.tab"), "a particle on the noun: {b:?}");
+        // a bare one-syllable word still names nothing, nor does a demonstrative before another noun
+        assert!(assign("줄").0.hits.is_empty());
+        assert!(!crate::korean::is_deictic_spatial_pair("그", "말"));
+        assert!(crate::korean::is_deictic_spatial_pair("아래", "행의"));
     }
 
     #[test]
