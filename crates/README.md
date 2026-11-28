@@ -3,7 +3,7 @@
 앱(`apps/core/`)과 raon-zena 가 함께 링크하는 crate 입니다. 앱과 같은 루트 작업 공간(`../Cargo.toml`)의 멤버입니다(`cargo test -p <crate>`, premium-discount 폴더에서. 2026-11-19 에 루트로 합치기 전에는 `crates/Cargo.toml` 이 따로 있던 작업 공간이었습니다). 이름은 약어 없이 `premium-discount-*` 로 씁니다(2026-11-17 `pd-*` 에서 바꿈). 같은 날 raon-zena 의 범용 엔진(센서 · 비전 · 양자화 · NLP · NMS)도 이리로 옮기고, Relay · 창 계산 crate 를 새로 만들었습니다. 2026-11-18 에는 logis-center 의 웹 행동 분석과 tracker-logis-center 를 `premium-discount-analytic` 으로 옮겼습니다.
 
 **원칙 (Tier 0 순수 라이브러리 루트)**
-- LanceDB · Tauri · 비동기 런타임(tokio) · 비전(`louis-vision`) 의존성 0건: 앱(`apps/`) 및 전사 비전 채점(`crates/pd-vision-eval`)은 `exclude` 로 분리해 Tier 2-A 에서 `<LV_LIB_PIN_REV>` 와 결합합니다.
+- LanceDB · Tauri · 비동기 런타임(tokio) · 비전(`louis-vision`) 의존성 0건: 앱(`apps/`) 및 전사 비전 채점(`crates/premium-discount-vision-eval`)은 `exclude` 로 분리해 Tier 2-A 에서 `<LV_LIB_PIN_REV>` 와 결합합니다.
 - candle 은 전 생태계 공통 `Qntology/candle-rocm-vulkan` 커밋(`f73415d4d149d7949e8a6a94911af670e4e10f7f`)으로 고정합니다.
 - 구 `premium-discount-sensor` · `premium-discount-vision` 은 `Qntology/louis-vision/crates/lv-screen` 으로 전량 이관되었고, 순수 2D 기하 원시 타입(`BBox`, `Polar`)만 `premium-discount-sds::geometry` 로 승격되었습니다.
 - 범용 평가 코어(`premium-discount-eval`: `rule`, `ranking`, `calib`, `gate_ab`, `accel_tol`, `hygiene`)가 추가되었습니다.

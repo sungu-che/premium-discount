@@ -1,5 +1,5 @@
 [package]
-name = "pd-vision-eval"
+name = "premium-discount-vision-eval"
 description = "Cross-ecosystem vision evaluation runner evaluating louis-vision (lv-screen, lv-doc, lv-spatial) with premium-discount-eval"
 workspace = "../../apps"
 version = "0.1.0"

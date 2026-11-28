@@ -1,4 +1,4 @@
-//! CLI runner for `pd-vision-eval`: 12-crate hygiene audit, 6-counterexample `--selftest`,
+//! CLI runner for `premium-discount-vision-eval`: 12-crate hygiene audit, 6-counterexample `--selftest`,
 //! multi-domain corpus evaluator (`--plan`/`--queries`, 15-lang E3 bootstrap), and `--release-seal` + 5Y WORM gate.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -7,9 +7,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
-use pd_vision_eval::cross_hygiene::{audit_workspace_hygiene, workspace_parent_root};
-use pd_vision_eval::doc_eval::run_doc_eval_suite;
-use pd_vision_eval::release_seal::{
+use premium_discount_vision_eval::cross_hygiene::{audit_workspace_hygiene, workspace_parent_root};
+use premium_discount_vision_eval::doc_eval::run_doc_eval_suite;
+use premium_discount_vision_eval::release_seal::{
     evaluate_final_release_seal, ReleaseSealInput, ZeroToleranceViolations,
 };
 use premium_discount_eval::ranking::{check_e3_non_inferiority, GateExit, Polarity};
@@ -416,7 +416,7 @@ fn write_worm_ledger_and_test_4_tamper_vectors(
 }
 
 fn run_selftest_six_counterexamples() -> Result<()> {
-    let dir = std::env::temp_dir().join(format!("pd-vision-eval-selftest-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("premium-discount-vision-eval-selftest-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
 
@@ -823,7 +823,7 @@ fn main() -> Result<()> {
         audio_tious.iter().sum::<f64>() / audio_tious.len() as f64
     };
     let report = EvalCliReport {
-        bin: "pd-vision-eval",
+        bin: "premium-discount-vision-eval",
         split,
         release_seal,
         engine_mode,

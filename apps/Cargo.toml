@@ -1,11 +1,11 @@
-# Tier 2-A workspace: cross-ecosystem vision evaluator (crates/pd-vision-eval) + headless core (apps/core)
+# Tier 2-A workspace: cross-ecosystem vision evaluator (crates/premium-discount-vision-eval) + headless core (apps/core)
 # Pins Tier 1 (Qntology/louis-vision) and patches transitive Tier 0 crates back to local ../crates/*.
 
 [workspace]
 resolver = "2"
 members = [
     "core",
-    "../crates/pd-vision-eval",
+    "../crates/premium-discount-vision-eval",
 ]
 exclude = [
     "desktop",

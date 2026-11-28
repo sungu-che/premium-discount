@@ -35,8 +35,8 @@ members = [
     "crates/onnxruntime-sys",
     "crates/onnxruntime",
 ]
-# workers/ (wasm32) 및 Tier 2-A 상위 워크스페이스(apps, pd-vision-eval)는 루트가 삼키지 않게 뺀다
-exclude = ["workers", "apps", "crates/pd-vision-eval"]
+# workers/ (wasm32) 및 Tier 2-A 상위 워크스페이스(apps, premium-discount-vision-eval)는 루트가 삼키지 않게 뺀다
+exclude = ["workers", "apps", "crates/premium-discount-vision-eval"]
 
 [workspace.package]
 version = "0.1.0"

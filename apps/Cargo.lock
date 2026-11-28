@@ -5405,27 +5405,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pd-vision-eval"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "candle-core",
- "image",
- "lv-core",
- "lv-doc",
- "lv-domain",
- "lv-planar",
- "lv-screen",
- "lv-spatial",
- "premium-discount-eval",
- "premium-discount-nav",
- "premium-discount-sds",
- "serde",
- "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5759,6 +5738,27 @@ name = "premium-discount-verdict"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "premium-discount-vision-eval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "image",
+ "lv-core",
+ "lv-doc",
+ "lv-domain",
+ "lv-planar",
+ "lv-screen",
+ "lv-spatial",
+ "premium-discount-eval",
+ "premium-discount-nav",
+ "premium-discount-sds",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
