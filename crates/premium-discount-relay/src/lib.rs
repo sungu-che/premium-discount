@@ -92,6 +92,213 @@ pub enum KeyKind {
     Symbol,
     /// 복합 명사 (`compound` · `flat` 으로 이어진 명사 덩어리)
     Compound,
+    /// 기술 기호 ([`TechnicalToken`]): 문장 키는 그 계열(`-O2` → `-O`), 체크포인트 키는 정규 꼴 그대로
+    TechnicalToken,
+}
+
+/// 키 조합의 수식 키 (대소문자 무시)
+const CHORD_MODIFIERS: &[&str] = &["ctrl", "control", "ctl", "alt", "option", "opt", "shift", "cmd", "command", "meta", "win", "super", "fn"];
+
+/// 통째로 지키는 기술 기호 하나: 키 조합(`Ctrl+Shift+B`), 명령줄 옵션(`-O2`, `-j`, `--release`, `--jobs=4`), 거듭제곱(`10^4`),
+/// 표의 열 · 행 참조(`C 열`, `row 3`). 2글자 미만 조각을 버리기 전에 먼저 박제한다.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TechnicalToken {
+    /// 정규 꼴: 키 조합은 소문자(`ctrl+shift+b`), 옵션은 쓴 그대로(`-O2` 와 `-o2` 는 뜻이 다르다), 열 · 행은 `col:C` · `row:3`
+    pub canonical: String,
+    /// 무엇을 정하는가 (단계 · 인자를 뺀 꼴): `-O2` → `-O`, `--jobs=4` → `--jobs`, 키 조합 → `chord`, `10^4` → `10^`,
+    /// `C 열` → `col`. 같은 것을 정하는 두 글은 이 키를 나누고, 정규 꼴은 값으로 견준다
+    pub family: String,
+}
+
+/// 낱말 앞뒤 문장 부호를 떼고, 한글 조사 등 ASCII 가 아닌 꼬리 앞까지 (`-O2로` → `-O2`)
+fn ascii_core(word: &str) -> &str {
+    let w = word.trim_matches(|c: char| matches!(c, ',' | '.' | ';' | ':' | '!' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '`'));
+    let end = w.char_indices().find(|(_, c)| !c.is_ascii()).map_or(w.len(), |(i, _)| i);
+    w[..end].trim_end_matches(|c: char| matches!(c, ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\''))
+}
+
+/// 낱말 하나가 기술 기호이면 그 꼴 (열 · 행 참조는 두 낱말이라 [`technical_tokens`] 가 본다)
+pub fn technical_token(word: &str) -> Option<TechnicalToken> {
+    let w = ascii_core(word);
+    if w.is_empty() || w.len() > 48 {
+        return None;
+    }
+    let name_ok = |n: &str| n.starts_with(|c: char| c.is_ascii_alphabetic()) && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if let Some(body) = w.strip_prefix("--") {
+        let name = body.split_once('=').map_or(body, |(n, _)| n);
+        return (name_ok(name) && name.len() <= 32).then(|| TechnicalToken { canonical: w.to_string(), family: format!("--{name}") });
+    }
+    if let Some(body) = w.strip_prefix('-') {
+        let name = body.split_once('=').map_or(body, |(n, _)| n);
+        if !name_ok(name) || name.len() > 16 || name.contains('-') {
+            return None;
+        }
+        let stem = name.trim_end_matches(|c: char| c.is_ascii_digit());
+        return Some(TechnicalToken { canonical: w.to_string(), family: format!("-{stem}") });
+    }
+    if w.contains('+') {
+        let parts: Vec<&str> = w.split('+').collect();
+        let (key, mods) = parts.split_last()?;
+        let chord = !mods.is_empty()
+            && mods.iter().all(|m| CHORD_MODIFIERS.contains(&m.to_ascii_lowercase().as_str()))
+            && (1..=12).contains(&key.len())
+            && key.chars().all(|c| c.is_ascii_alphanumeric());
+        return chord.then(|| TechnicalToken { canonical: w.to_ascii_lowercase(), family: "chord".into() });
+    }
+    if let Some((base, exp)) = w.split_once('^') {
+        let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+        let exp_ok = digits(exp.strip_prefix('-').unwrap_or(exp));
+        return (digits(base) && exp_ok).then(|| TechnicalToken { canonical: w.to_string(), family: format!("{base}^") });
+    }
+    None
+}
+
+/// 글 속의 기술 기호 (나온 순서, 중복 없이): 낱말마다 [`technical_token`], 그리고 두 낱말짜리 열 · 행 참조
+/// (`C 열` · `C열` · `3 행` · `col C` · `column B` · `row 3`)
+pub fn technical_tokens(text: &str) -> Vec<TechnicalToken> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let label = |s: &str| -> Option<String> {
+        let s = ascii_core(s);
+        let letters = (1..=3).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphabetic());
+        let digits = (1..=4).contains(&s.len()) && s.chars().all(|c| c.is_ascii_digit());
+        (letters || digits).then(|| s.to_ascii_uppercase())
+    };
+    // 한국어 "열" · "행" (조사가 붙어도: "열의", "행에")
+    let ko_axis = |s: &str| -> Option<&'static str> {
+        match premium_discount_nms::korean::noun_lemma(s.trim_matches(|c: char| c.is_ascii_punctuation())).as_str() {
+            "열" => Some("col"),
+            "행" => Some("row"),
+            _ => None,
+        }
+    };
+    let mut out: Vec<TechnicalToken> = Vec::new();
+    let mut push = |t: TechnicalToken| {
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    };
+    for (i, w) in words.iter().enumerate() {
+        if let Some(t) = technical_token(w) {
+            push(t);
+            continue;
+        }
+        let axis_ref = |axis: &str, x: String| TechnicalToken { canonical: format!("{axis}:{x}"), family: axis.to_string() };
+        // "C열" (붙여 씀)
+        let head = ascii_core(w);
+        if !head.is_empty() && w.starts_with(head) && head.len() < w.len() {
+            if let (Some(x), Some(axis)) = (label(head), ko_axis(&w[head.len()..])) {
+                push(axis_ref(axis, x));
+                continue;
+            }
+        }
+        if let Some(next) = words.get(i + 1) {
+            if let (Some(x), Some(axis)) = (label(w), ko_axis(next)) {
+                push(axis_ref(axis, x));
+                continue;
+            }
+            let en = match ascii_core(w).to_ascii_lowercase().as_str() {
+                "col" | "column" => Some("col"),
+                "row" => Some("row"),
+                _ => None,
+            };
+            // 영어 꼴은 대문자 · 숫자 이름만 ("row 3", "column B"; "a row of" 는 아님)
+            let named = ascii_core(next);
+            let strict = !named.is_empty() && (named.chars().all(|c| c.is_ascii_uppercase()) || named.chars().all(|c| c.is_ascii_digit()));
+            if let (Some(axis), Some(x), true) = (en, label(next), strict) {
+                push(axis_ref(axis, x));
+            }
+        }
+    }
+    out
+}
+
+/// 한 작업에서 자주 짝을 이루는 창 종류
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkSurface {
+    Terminal,
+    Ide,
+    Browser,
+    Docs,
+    Other,
+}
+
+/// 창을 바꾼 뒤 대명사가 앞 창의 대화를 가리킬 수 있는 시간 (밀리초)
+pub const ANAPHORA_BRIDGE_MS: u64 = 15_000;
+
+/// 창을 바꾼 직후의 대명사("그 에러", "이거")가 앞 창 대화의 주제를 가리켜도 되는가. 짝 전환(터미널 ⇄ IDE, 브라우저 ⇄
+/// 문서)이고, 바꾼 지 [`ANAPHORA_BRIDGE_MS`] 안이고, 두 창이 정밀한 키(식별자 · 기호 · 따옴표 이름 · 기술 기호 — 오류 코드나
+/// 파일 이름)를 하나 이상 나눌 때만 참이다. 그 밖에는 무관한 창 전환의 단절(토픽 가중치 0.0)을 그대로 지킨다.
+pub fn anaphora_bridge_allowed(from: WorkSurface, to: WorkSurface, since_switch_ms: u64, shared: &[RelayKey]) -> bool {
+    use WorkSurface::*;
+    let paired = matches!((from, to), (Terminal, Ide) | (Ide, Terminal) | (Browser, Docs) | (Docs, Browser));
+    paired
+        && since_switch_ms <= ANAPHORA_BRIDGE_MS
+        && shared
+            .iter()
+            .any(|k| matches!(k.kind, KeyKind::Identifier | KeyKind::Symbol | KeyKind::Quoted | KeyKind::TechnicalToken))
+}
+
+/// 문서 사이 사건 간선의 신뢰 등급
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeTrust {
+    /// 원본과 일치하거나, 광학 열화(스캔 · 촬영) 판독이 그림자 판독과 교차 확인됨: 사건이 성립하고 정합성도 인정한다
+    Certified,
+    /// 디지털 원본에서 검사 숫자 · 승인 번호가 어긋남: 사건을 따라가는 데만 쓰고, 자동 승인의 근거로는 쓰지 않는다
+    FaultTracingOnly,
+}
+
+impl EdgeTrust {
+    /// 이 간선을 근거로 자동 승인해도 되는가
+    pub fn may_auto_approve(self) -> bool {
+        self == EdgeTrust::Certified
+    }
+}
+
+/// 사건 간선의 역할
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeRole {
+    /// 한 사건의 서류들을 한 봉투로 합치고(union), 반려되면 다시 나눈다(de-union)
+    CaseBinding,
+    /// 여러 사건이 함께 쓰는 운반자(용기 번호 · 설비 코드 · 공용 계좌 …): 거꾸로 찾아가는 데만 지나고, 다른 사건을 합치지 않는다
+    CarrierTraversal,
+}
+
+impl EdgeRole {
+    /// 이 간선이 두 끝을 한 사건으로 합치는가
+    pub fn merges_cases(self) -> bool {
+        self == EdgeRole::CaseBinding
+    }
+}
+
+/// 사건 간선 하나: 두 끝의 64비트 개체 키 ([`entity_key_u64`]), 역할, 신뢰. 방향을 뒤집어도 같은 간선이다
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct CaseEdge {
+    pub from: u64,
+    pub to: u64,
+    pub role: EdgeRole,
+    pub trust: EdgeTrust,
+}
+
+impl CaseEdge {
+    pub fn reversed(self) -> CaseEdge {
+        CaseEdge { from: self.to, to: self.from, ..self }
+    }
+
+    /// 방향 없는 비교용 꼴 (작은 키가 앞)
+    pub fn undirected(self) -> CaseEdge {
+        if self.from <= self.to {
+            self
+        } else {
+            self.reversed()
+        }
+    }
+}
+
+/// 개체 키의 64비트 해시: 앞뒤 공백을 떼고 소문자로 바꾼 키의 FNV-1a 64. 여러 문서 묶음이 한 결속 엔진을 써도 충돌이 드물다
+pub fn entity_key_u64(key: &str) -> u64 {
+    premium_discount_nms::embed::fnv1a_64(&lower(key))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -180,9 +387,18 @@ pub fn relay_keys(s: &Sentence) -> Vec<RelayKey> {
     for q in quoted_spans(&s.text) {
         out.insert(RelayKey { key: q, kind: KeyKind::Quoted });
     }
+    // 두 낱말짜리 열 · 행 참조 ("C 열"): 낱말 하나씩으로는 보이지 않는다
+    for tt in technical_tokens(&s.text).into_iter().filter(|t| t.family == "col" || t.family == "row") {
+        out.insert(RelayKey { key: tt.family, kind: KeyKind::TechnicalToken });
+    }
     for t in &s.tokens {
         let surface = t.text.trim();
         if surface.is_empty() {
+            continue;
+        }
+        // 기술 기호는 계열을 주제 키로 (정규 꼴은 주장의 값: `-O2` → `-O3` 가 대체로 잡힌다)
+        if let Some(tt) = technical_token(surface) {
+            out.insert(RelayKey { key: tt.family, kind: KeyKind::TechnicalToken });
             continue;
         }
         if t.upos == "PROPN" {
@@ -685,6 +901,11 @@ pub fn claim(s: &Sentence) -> Claim {
         if conditions.contains(&i) || pol.particles.contains(&i) {
             continue;
         }
+        // 기술 기호는 값이다 (`-O2`, `ctrl+shift+b`, `10^4`)
+        if let Some(tt) = technical_token(t.text.trim()) {
+            c.values.push(tt.canonical);
+            continue;
+        }
         let rel = rel_of(t);
         let is_root = pol.root == Some(i) || rel == "root";
         let digits = t.text.chars().any(|ch| ch.is_ascii_digit());
@@ -714,6 +935,9 @@ pub fn claim(s: &Sentence) -> Claim {
         if content && (is_root || matches!(rel, "nsubj" | "obj" | "dislocated")) {
             c.core.insert(positive.unwrap_or_else(|| lemma_or_text(t)));
         }
+    }
+    for tt in technical_tokens(&s.text).into_iter().filter(|t| t.family == "col" || t.family == "row") {
+        c.values.push(tt.canonical);
     }
     c.values.sort();
     c
@@ -1183,6 +1407,10 @@ pub fn lift_checkpoint_relay_keys(meta: &CheckpointMeta<'_>) -> Vec<RelayKey> {
         }
         for q in quoted_spans(trimmed) {
             out.insert(RelayKey { key: q, kind: KeyKind::Quoted });
+        }
+        // 기술 기호는 쪼개기 전에 정규 꼴 그대로 (`-j` · `C 열` 은 쪼개면 2글자 미만으로 사라진다)
+        for tt in technical_tokens(trimmed) {
+            out.insert(RelayKey { key: tt.canonical, kind: KeyKind::TechnicalToken });
         }
         for tok in trimmed.split(|c: char| c.is_whitespace() || matches!(c, '|' | '/' | '-' | '·' | ',' | '(' | ')' | '[' | ']')) {
             let clean = tok.trim_matches(|c: char| matches!(c, '.' | '!' | '?' | '"' | '\'' | ':' | ';'));
@@ -1831,6 +2059,118 @@ mod tests {
         assert!(has("Surface lost", KeyKind::Quoted), "{keys:?}");
         assert!(has("malenia 보스", KeyKind::Compound), "{keys:?}");
         assert_eq!(quoted_spans("「보스」와 “Malenia” 그리고 'E0425'"), vec!["보스", "Malenia", "E0425"]);
+    }
+
+    #[test]
+    fn technical_tokens_stay_whole_and_name_their_family() {
+        let got: Vec<(String, String)> = technical_tokens(
+            "빌드는 Ctrl+Shift+B, 실행은 Alt+F5. cargo build -O2로 --release -j 1 --jobs=4 그리고 C 열, D열의 값은 10^4; row 3, a row of x",
+        )
+        .into_iter()
+        .map(|t| (t.canonical, t.family))
+        .collect();
+        let want: Vec<(String, String)> = [
+            ("ctrl+shift+b", "chord"),
+            ("alt+f5", "chord"),
+            ("-O2", "-O"),
+            ("--release", "--release"),
+            ("-j", "-j"),
+            ("--jobs=4", "--jobs"),
+            ("col:C", "col"),
+            ("col:D", "col"),
+            ("10^4", "10^"),
+            ("row:3", "row"),
+        ]
+        .iter()
+        .map(|(c, f)| (c.to_string(), f.to_string()))
+        .collect();
+        assert_eq!(got, want);
+        for plain in ["-3", "C++", "E0425", "-", "--", "A+B", "v1.4", "3,000원", "x^2", "-이다", "re-run"] {
+            assert!(technical_token(plain).is_none(), "{plain}");
+        }
+        assert_eq!(technical_token("-O2").unwrap().canonical, "-O2", "옵션은 대소문자를 지킨다");
+        assert_ne!(technical_token("-O2"), technical_token("-o2"));
+    }
+
+    /// "Build release with -O2" 를 손으로 분석한 문장 (옵션만 바꿔 쓴다)
+    fn flag_tip(flag: &str) -> Sentence {
+        Sentence {
+            text: format!("Build release with {flag}"),
+            tokens: vec![
+                tok("Build", "build", "VERB", "root", 0),
+                tok("release", "release", "NOUN", "obj", 1),
+                tok("with", "with", "ADP", "case", 4),
+                tok(flag, flag, "X", "obl", 1),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_changed_command_line_flag_supersedes_the_old_tip() {
+        let e = HashedNgramEmbedder::default();
+        let cfg = RelayConfig::default();
+        let old = Record { sentences: vec![flag_tip("-O2")], at_ms: 1_000 };
+        let new = Record { sentences: vec![flag_tip("-O3")], at_ms: 2_000 };
+        // 주제 키는 계열 하나, 정규 꼴은 값
+        assert_eq!(relay_keys(&old.sentences[0]), vec![RelayKey { key: "-O".into(), kind: KeyKind::TechnicalToken }]);
+        assert_eq!(claim(&old.sentences[0]).values, vec!["-O2".to_string()]);
+        let all: Vec<RelayKey> = [&old, &new].iter().flat_map(|r| r.sentences.iter().flat_map(relay_keys)).collect();
+        let keys = cluster_keys(&all, &e, &cfg);
+        let (rel, cmp) = compare(&old, &new, &keys, &e, &cfg);
+        match rel {
+            Relation::Supersedes { changes, containment } => {
+                assert_eq!((changes[0].old_values.clone(), changes[0].new_values.clone()), (vec!["-O2".to_string()], vec!["-O3".to_string()]));
+                assert!(containment >= 0.99, "{containment}");
+            }
+            other => panic!("{other:?} {cmp:?}"),
+        }
+    }
+
+    #[test]
+    fn checkpoints_keep_short_flags_and_column_references() {
+        let meta = CheckpointMeta {
+            tab_title: Some("Terminal - cargo build -j 1 -O2"),
+            screen_label: Some("C 열 값 확인"),
+            badge_labels: &["Ctrl+B"],
+            ..CheckpointMeta::default()
+        };
+        let keys = lift_checkpoint_relay_keys(&meta);
+        let tech: Vec<&str> = keys.iter().filter(|k| k.kind == KeyKind::TechnicalToken).map(|k| k.key.as_str()).collect();
+        for want in ["-j", "-O2", "col:C", "ctrl+b"] {
+            assert!(tech.contains(&want), "{want} in {keys:?}");
+        }
+        let hidden = CheckpointMeta { sensitive_or_incognito: true, ..meta };
+        assert!(lift_checkpoint_relay_keys(&hidden).is_empty());
+    }
+
+    #[test]
+    fn pronouns_bridge_only_paired_recent_switches_sharing_a_precise_key() {
+        use WorkSurface::*;
+        let err = [RelayKey { key: "e0425".into(), kind: KeyKind::Identifier }];
+        let topic = [RelayKey { key: "boss".into(), kind: KeyKind::Proper }];
+        assert!(anaphora_bridge_allowed(Terminal, Ide, 9_000, &err));
+        assert!(anaphora_bridge_allowed(Docs, Browser, ANAPHORA_BRIDGE_MS, &err));
+        assert!(!anaphora_bridge_allowed(Terminal, Ide, ANAPHORA_BRIDGE_MS + 1, &err), "too late");
+        assert!(!anaphora_bridge_allowed(Terminal, Browser, 1_000, &err), "not a paired switch");
+        assert!(!anaphora_bridge_allowed(Terminal, Ide, 1_000, &topic), "a loose topic name is not a precise key");
+        assert!(!anaphora_bridge_allowed(Terminal, Ide, 1_000, &[]), "nothing shared keeps the cut at 0.0");
+        assert!(!anaphora_bridge_allowed(Other, Ide, 1_000, &err));
+    }
+
+    #[test]
+    fn case_edges_are_reversible_and_their_grades_serialize_in_snake_case() {
+        let a = entity_key_u64("  Doc-0042 ");
+        assert_eq!(a, entity_key_u64("doc-0042"), "trimmed and lower-cased");
+        assert_ne!(a, entity_key_u64("doc-0043"));
+        let e = CaseEdge { from: a, to: entity_key_u64("doc-0043"), role: EdgeRole::CaseBinding, trust: EdgeTrust::FaultTracingOnly };
+        assert_eq!(e.reversed().reversed(), e);
+        assert_eq!(e.undirected(), e.reversed().undirected());
+        assert!(EdgeRole::CaseBinding.merges_cases() && !EdgeRole::CarrierTraversal.merges_cases());
+        assert!(EdgeTrust::Certified.may_auto_approve() && !EdgeTrust::FaultTracingOnly.may_auto_approve());
+        assert_eq!(serde_json::to_string(&EdgeTrust::FaultTracingOnly).unwrap(), "\"fault_tracing_only\"");
+        assert_eq!(serde_json::to_string(&EdgeRole::CarrierTraversal).unwrap(), "\"carrier_traversal\"");
+        let back: CaseEdge = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(back, e);
     }
 
     #[test]

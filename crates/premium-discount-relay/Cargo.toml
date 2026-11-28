@@ -8,11 +8,14 @@ license.workspace = true
 [dependencies]
 premium-discount-nms.workspace = true
 premium-discount-sds.workspace = true
+# 사건 간선 등급(EdgeTrust · EdgeRole · CaseEdge)은 저장 · 전송된다
+serde.workspace = true
 # 기능 `stanza`: Stanza 분석 결과를 문장으로 바꾸기 (premium-discount-nlp)
 premium-discount-nlp = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true
+serde_json.workspace = true
 # 대체 → PD-Verdict superseded 연결 시험 (tests/supersede_verdict.rs)
 premium-discount-verdict.workspace = true
 
