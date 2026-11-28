@@ -19,6 +19,7 @@ pub mod blob;
 pub mod event;
 pub mod forget;
 pub mod funnel;
+pub mod negation;
 pub mod pug;
 pub mod query;
 pub mod report;

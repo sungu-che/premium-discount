@@ -21,8 +21,9 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
+use premium_discount_nms::analyze::{read_span, Analyzer, RuleAnalyzer};
 use premium_discount_nms::embed::{HashedNgramEmbedder, SharedEmbedder, TextEmbedder};
-use premium_discount_nms::normalize::normalize;
+use premium_discount_nms::normalize::{normalize, Normalized, Word};
 use premium_discount_nms::{DomainBank, DomainSpec};
 use serde::{Deserialize, Serialize};
 
@@ -179,7 +180,19 @@ pub struct AnalyticQuery {
     /// 기간 비교 창: 기간이 둘이거나 비교하는 말이 있을 때 (진행 중인 기간은 같은 경과 시간으로 자른다). 비교가 아니면 None
     #[serde(default)]
     pub comparison: Option<ComparisonWindow>,
+    /// 부분 부정으로 뺀 사건 종류 ("…는데 결제 페이지는 안 간", "but not the checkout", [`crate::negation`]). 포함 목록에는 없다
+    #[serde(default)]
+    pub excluded_event_types: Vec<String>,
+    /// 부분 부정으로 뺀 페이지 종류
+    #[serde(default)]
+    pub excluded_page_kinds: Vec<String>,
+    /// 부분 부정으로 뺀 행동
+    #[serde(default)]
+    pub excluded_action_kinds: Vec<String>,
 }
+
+/// 걸린 근거 하나: (갈래, 키, 시작 낱말, 걸린 글, 걸린 글자 수, 어떻게)
+type RawHit = (Category, String, usize, String, usize, String);
 
 /// 한자 · 가나 (띄어 쓰지 않는 글)
 fn is_cjk(c: char) -> bool {
@@ -261,8 +274,9 @@ impl QueryParser {
     /// 질의를 해석한다. `lang` 은 사용자 언어(시간대 · 반구), `now_ms` 는 현재 시각
     pub fn parse(&self, text: &str, lang: &str, now_ms: i64) -> AnalyticQuery {
         let words = normalize(text).words;
-        // (갈래, 키, 시작 낱말, 걸린 글, 걸린 글자 수, 어떻게)
-        let mut hits: Vec<(Category, String, usize, String, usize, String)> = Vec::new();
+        let mut hits: Vec<RawHit> = Vec::new();
+        // 걸린 구간의 (끝 낱말 번호, 낱말 안에서 찾은 글인가): 부분 부정 판정용, hits 와 같은 순서
+        let mut extents: Vec<(usize, bool)> = Vec::new();
         for (cat, bank) in &self.banks {
             for start in 0..words.len() {
                 for len in (1..=MAX_SPAN_WORDS.min(words.len() - start)).rev() {
@@ -271,6 +285,7 @@ impl QueryParser {
                         let phrase = span.iter().map(|w| w.surface.as_str()).collect::<Vec<_>>().join(" ");
                         let chars = phrase.chars().filter(|c| !c.is_whitespace()).count();
                         hits.push((*cat, bank.entry(i).key.clone(), start, phrase, chars, format!("{hit:?}").to_lowercase()));
+                        extents.push((start + len, false));
                         break;
                     }
                 }
@@ -285,9 +300,11 @@ impl QueryParser {
             for (cat, key, p) in &self.glued {
                 if surface.contains(p.as_str()) && !hits.iter().any(|h| h.0 == *cat && h.1 == *key && h.2 == i) {
                     hits.push((*cat, key.clone(), i, p.clone(), p.chars().count(), "glued".into()));
+                    extents.push((i + 1, true));
                 }
             }
         }
+        let excluded = hit_polarities(text, lang, &words, &hits, &extents);
         let mut evidence: Vec<Evidence> = hits
             .iter()
             .map(|(c, k, _, p, _, h)| Evidence { category: *c, key: k.clone(), phrase: p.clone(), hit: h.clone() })
@@ -308,6 +325,21 @@ impl QueryParser {
             }
             out
         };
+        // 사건 · 페이지 · 행동은 부분 부정으로 포함과 제외를 가른다 (키마다 하나의 판정, [`hit_polarities`])
+        let split = |cat: Category| -> (Vec<String>, Vec<String>) {
+            let (mut inc, mut exc) = (Vec::new(), Vec::new());
+            for key in many(cat) {
+                if excluded.get(&(cat, key.clone())).copied().unwrap_or(false) {
+                    exc.push(key);
+                } else {
+                    inc.push(key);
+                }
+            }
+            (inc, exc)
+        };
+        let (event_types, excluded_event_types) = split(Category::Event);
+        let (page_kinds, excluded_page_kinds) = split(Category::Page);
+        let (action_kinds, excluded_action_kinds) = split(Category::Action);
         let time_key = single(Category::Time);
         let season_key = single(Category::Season);
         let mut insight = single(Category::Insight);
@@ -339,15 +371,75 @@ impl QueryParser {
             time_key,
             season_key,
             range,
-            event_types: many(Category::Event),
-            page_kinds: many(Category::Page),
-            action_kinds: many(Category::Action),
+            event_types,
+            page_kinds,
+            action_kinds,
             insight,
             evidence,
             compare_key,
             comparison,
+            excluded_event_types,
+            excluded_page_kinds,
+            excluded_action_kinds,
         }
     }
+}
+
+/// 걸린 사건 · 페이지 · 행동 키마다 제외인지: 주절의 마지막 판정, 주절에 없으면 마지막 판정. 부정 수는
+/// [`crate::negation::span_polarities`](질의 언어의 표지)와, 낱말 구간이면 nms [`read_span`] 의 부정 수 중 큰 쪽이다
+fn hit_polarities(text: &str, lang: &str, words: &[Word], hits: &[RawHit], extents: &[(usize, bool)]) -> BTreeMap<(Category, String), bool> {
+    let lower: Vec<char> = text.to_lowercase().chars().collect();
+    // 낱말의 글자 번호 (text.to_lowercase() 기준, 앞에서부터 차례로 찾는다)
+    let mut word_at: Vec<Option<(usize, usize)>> = Vec::with_capacity(words.len());
+    let mut cursor = 0usize;
+    for w in words {
+        let s: Vec<char> = w.surface.to_lowercase().chars().collect();
+        let found = if s.is_empty() || s.len() > lower.len() {
+            None
+        } else {
+            (cursor..=lower.len() - s.len()).find(|&i| lower[i..i + s.len()] == s[..])
+        };
+        word_at.push(found.map(|i| (i, i + s.len())));
+        if let Some(i) = found {
+            cursor = i + s.len();
+        }
+    }
+    let char_span = |h: &RawHit, end: usize, glued: bool| -> Option<(usize, usize)> {
+        if glued {
+            let (ws, we) = word_at.get(h.2).copied().flatten()?;
+            let p: Vec<char> = h.3.to_lowercase().chars().collect();
+            let last = we.checked_sub(p.len())?;
+            let at = (ws..=last).find(|&i| lower[i..i + p.len()] == p[..])?;
+            Some((at, at + p.len()))
+        } else {
+            let (s, _) = word_at.get(h.2).copied().flatten()?;
+            let (_, e) = word_at.get(end.checked_sub(1)?).copied().flatten()?;
+            Some((s, e))
+        }
+    };
+    let picked: Vec<usize> = (0..hits.len()).filter(|&i| matches!(hits[i].0, Category::Event | Category::Page | Category::Action)).collect();
+    let spans: Vec<Option<(usize, usize)>> = picked.iter().map(|&i| char_span(&hits[i], extents[i].0, extents[i].1)).collect();
+    let located: Vec<(usize, usize)> = spans.iter().flatten().copied().collect();
+    let mut pols = crate::negation::span_polarities(text, lang, &located).into_iter();
+    let mut analyzed = Normalized { text: text.to_string(), words: words.to_vec(), addressed: false };
+    RuleAnalyzer.analyze(&mut analyzed);
+    // 키 → (제외인가, 주절의 판정인가)
+    let mut verdict: BTreeMap<(Category, String), (bool, bool)> = BTreeMap::new();
+    for (k, &i) in picked.iter().enumerate() {
+        let pol = if spans[k].is_some() { pols.next() } else { None };
+        let mut negations = pol.map_or(0, |p| p.negations);
+        let main = pol.is_none_or(|p| p.main);
+        if !extents[i].1 {
+            negations = negations.max(read_span(&analyzed.words, hits[i].2, extents[i].0).negations);
+        }
+        let out = negations % 2 == 1;
+        let entry = verdict.entry((hits[i].0, hits[i].1.clone())).or_insert((out, main));
+        // 주절의 판정이 양보절의 것을 이기고, 같은 쪽이면 뒤의 것이 이긴다
+        if main || !entry.1 {
+            *entry = (out, main || entry.1);
+        }
+    }
+    verdict.into_iter().map(|(key, (out, _))| (key, out)).collect()
 }
 
 #[cfg(test)]
@@ -463,5 +555,34 @@ mod tests {
         assert_eq!(d.page_kind_of("https://shop.example.com/cartography"), None, "경로 조각 경계에서만 맞는다");
         assert!(d.page_kind_of("https://shop.example.com/goods/view/123").is_some());
         assert_eq!(d.action_types("add_to_cart"), ["click", "touch"]);
+    }
+
+    #[test]
+    fn partial_negation_splits_included_and_excluded_pages() {
+        let p = parser();
+        let cases = [
+            ("ko", "장바구니 페이지는 봤는데 결제 페이지는 안 간 기록"),
+            ("en", "visits that reached the cart page but not the checkout"),
+            ("de", "Besuche mit Warenkorbseite, aber ohne Kasse"),
+            ("es", "visitas a la página del carrito pero no al pago"),
+        ];
+        for (lang, text) in cases {
+            let q = p.parse(text, lang, NOW);
+            assert_eq!(q.page_kinds, vec!["cart".to_string()], "{lang}: {q:?}");
+            assert_eq!(q.excluded_page_kinds, vec!["checkout".to_string()], "{lang}: {q:?}");
+        }
+        // 부정이 없으면 예전과 같다: 제외 목록은 비고 둘 다 포함
+        let q = p.parse("cart page and checkout visits", "en", NOW);
+        assert_eq!((q.page_kinds.len(), q.excluded_page_kinds.len()), (2, 0), "{q:?}");
+        // 이중 부정은 긍정
+        let q = p.parse("not without the checkout", "en", NOW);
+        assert_eq!((q.page_kinds.clone(), q.excluded_page_kinds.clone()), (vec!["checkout".to_string()], vec![]), "{q:?}");
+        // 예전 JSON 은 제외 칸 없이도 읽힌다
+        let mut v = serde_json::to_value(&q).unwrap();
+        for k in ["excluded_event_types", "excluded_page_kinds", "excluded_action_kinds"] {
+            v.as_object_mut().unwrap().remove(k);
+        }
+        let back: AnalyticQuery = serde_json::from_value(v).unwrap();
+        assert!(back.excluded_page_kinds.is_empty());
     }
 }

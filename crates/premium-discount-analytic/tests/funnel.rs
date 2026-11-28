@@ -413,3 +413,93 @@ fn cn253_cross_boundary_1hop_post_pick_classifies_dark_pattern_button_as_frictio
     assert!(diag.abandon_rate.unwrap_or(0.0) >= 0.5);
     assert!(diag.post_friction_z.unwrap_or(0.0) >= 1.0);
 }
+
+#[test]
+fn peek_and_return_context_is_benign_only_when_clean() {
+    use premium_discount_analytic::funnel::PostPickContext;
+    let benign = PostPickContext { dwell_ms: 9_000, tts_budget_ms: 3_600, rage_or_retry_count: 0, clean_dismiss_key: true, parent_progressed: true };
+    assert!(benign.is_benign_peek_and_return(), "9 s is inside 8 s + 3.6 s of listening");
+    assert!(!PostPickContext::default().is_benign_peek_and_return(), "the default context keeps the old verdicts");
+    assert!(!PostPickContext { dwell_ms: 12_000, ..benign }.is_benign_peek_and_return());
+    assert!(!PostPickContext { rage_or_retry_count: 1, ..benign }.is_benign_peek_and_return());
+    assert!(!PostPickContext { clean_dismiss_key: false, ..benign }.is_benign_peek_and_return());
+    assert!(!PostPickContext { parent_progressed: false, ..benign }.is_benign_peek_and_return());
+    assert!(PostPickContext { dwell_ms: 7_900, tts_budget_ms: 0, ..benign }.is_benign_peek_and_return(), "sighted users get the plain 8 s");
+}
+
+/// 스크린리더 사용자가 옵션 대화상자를 열어 첫 안내만 듣고 뒤로 닫은 뒤 부모 화면에서 이어 간다 (PeekAndReturn).
+/// `rage` 면 대화상자에서 광클하고, `leave` 면 돌아와서 떠난다 (둘 다 면책이 아니다)
+fn options_peek_session(sid: &str, peek_btn: &Element, peers: &[Element], next_btn: &Element, rage: bool, leave: bool) -> Vec<WebEvent> {
+    let p1 = "https://app.example/settings";
+    let p2 = "https://app.example/settings/advanced";
+    let mut pick = ev(EventKind::Click, p1, sid, 1, 1_000);
+    pick.target = Some(peek_btn.clone());
+    pick.related = peers.to_vec();
+    let mut events = vec![ev(EventKind::Enter, p1, sid, 0, 0), pick, ev(EventKind::Enter, p2, sid, 2, 1_400)];
+    if rage {
+        let mut r = ev(EventKind::Click, p2, sid, 3, 2_000);
+        r.target = Some(button("toggle", "켜기"));
+        r.rage = true;
+        events.push(r);
+    }
+    events.push(ev(EventKind::Back, p1, sid, 4, 4_400));
+    if leave {
+        events.push(ev(EventKind::Leave, p1, sid, 5, 5_000));
+    } else {
+        let mut next = ev(EventKind::Click, p1, sid, 5, 5_000);
+        next.target = Some(next_btn.clone());
+        events.push(next);
+        events.push(ev(EventKind::Submit, p1, sid, 6, 7_000));
+    }
+    events
+}
+
+#[test]
+fn a_screen_reader_peek_and_return_is_not_a_friction_trap() {
+    use premium_discount_analytic::funnel::{canonical_of, post_pick_windows_v2, post_pick_windows_v2_with, AbandonPolicy, DebiasedChoiceBook, WebElementKind};
+    use premium_discount_nav::{reading_grace_ms, BehaviorParams};
+    let params = BehaviorParams::default();
+    let peek_btn = button("advanced", "고급 설정");
+    let other = button("basic", "기본 설정");
+    let peer = button("reset", "초기화");
+    let next_btn = button("save", "저장");
+    let tts = reading_grace_ms(30);
+    assert_eq!(tts, 3_600);
+    let run = |peek: Option<u32>, rage: bool, leave: bool| {
+        let mut book = DebiasedChoiceBook::default();
+        for s in 0..6 {
+            // the baseline: another option, finished on the page
+            let sid = format!("base-{s}");
+            let mut click = ev(EventKind::Click, "https://app.example/settings", &sid, 1, 1_000);
+            click.target = Some(other.clone());
+            click.related = vec![peek_btn.clone(), peer.clone()];
+            let events = vec![ev(EventKind::Enter, "https://app.example/settings", &sid, 0, 0), click.clone(), ev(EventKind::Submit, "https://app.example/settings", &sid, 2, 3_000)];
+            book.observe_event(&click);
+            for w in post_pick_windows_v2_with(&events, &params, AbandonPolicy::Always, peek) {
+                book.observe_window(&w, params.eps);
+            }
+        }
+        let mut peeks = 0;
+        for s in 0..12 {
+            let events = options_peek_session(&format!("sr-{s}"), &peek_btn, &[other.clone(), peer.clone()], &next_btn, rage, leave);
+            book.observe_event(&events[1]);
+            for w in post_pick_windows_v2_with(&events, &params, AbandonPolicy::Always, peek) {
+                peeks += usize::from(w.peek);
+                book.observe_window(&w, params.eps);
+            }
+        }
+        let key = canonical_of(&page_hash("https://app.example/settings").unwrap(), &peek_btn).stable_key;
+        (book.diagnose(&key).expect("diagnosed").kind, peeks)
+    };
+    // without the exemption (v2 as before): every look-and-close is a 1-hop bounce → friction trap
+    assert_eq!(run(None, false, false), (WebElementKind::FrictionTrap, 0));
+    let plain: Vec<_> = post_pick_windows_v2(&options_peek_session("x", &peek_btn, &[other.clone()], &next_btn, false, false), &params, AbandonPolicy::Always);
+    assert!(plain.iter().any(|w| w.abandoned && !w.peek), "v2 is unchanged: {plain:?}");
+    // with it: the clean peeks stay out of friction and of the abandon denominator
+    let (kind, peeks) = run(Some(tts), false, false);
+    assert_eq!(peeks, 12);
+    assert_ne!(kind, WebElementKind::FrictionTrap);
+    // a rage click in the dialog, or leaving after coming back, is still friction
+    assert_eq!(run(Some(tts), true, false), (WebElementKind::FrictionTrap, 0));
+    assert_eq!(run(Some(tts), false, true), (WebElementKind::FrictionTrap, 0));
+}

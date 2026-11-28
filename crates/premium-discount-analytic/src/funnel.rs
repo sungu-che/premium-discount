@@ -953,6 +953,15 @@ impl DebiasedChoiceBook {
         z
     }
 
+    /// 고른 뒤 구간 하나를 [`observe_post_pick`](Self::observe_post_pick) 으로 쌓는다. 확인 뒤 복귀(`peek`) 구간은 sign 0 이라
+    /// 마찰 기준선에도 이탈 분모에도 넣지 않는다 (쌓지 않으면 None)
+    pub fn observe_window(&mut self, w: &PostPick, eps: f64) -> Option<f64> {
+        if w.peek {
+            return None;
+        }
+        self.observe_post_pick(&w.choice.stable_key, &w.page, w.friction, w.completed, w.abandoned, eps)
+    }
+
     /// 후보 하나의 교차 진단 (마찰 거부권 포함). 본 적 없는 키는 None
     pub fn diagnose(&self, stable_key: &str) -> Option<DiagnosedChoiceRow> {
         let t = self.items.get(stable_key)?;
@@ -996,6 +1005,35 @@ pub struct PostPick {
     /// 고르고 바로 떠났다: 구간에 이탈(`Abandoned`)이 있거나, 다른 페이지 · 다른 선택 없이 제출하지 않고 떠나며 세션이 끝났다
     /// (이탈 면제 규칙을 쓰면 상품 상세를 그냥 닫은 것은 빼고)
     pub abandoned: bool,
+    /// 확인하고 돌아옴(PeekAndReturn, [`PostPickContext::is_benign_peek_and_return`]): 다음 화면을 열어 첫 안내만 듣고 깨끗이
+    /// 닫은 뒤 부모 화면에서 이어 간 구간. 마찰도 이탈도 아니며(sign 0) 이탈 분모에서 빠진다
+    /// ([`DebiasedChoiceBook::observe_window`])
+    pub peek: bool,
+}
+
+/// 고른 뒤 다음 화면에 다녀온 한 번의 맥락: 확인하고 돌아온 정상 행동인지 가린다
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PostPickContext {
+    /// 다음 화면에 머문 시간
+    pub dwell_ms: u32,
+    /// 읽어 주는 데 드는 시간 (`READING_MS_PER_CHAR` × 읽은 글자 수, 화면을 보는 사용자는 0)
+    pub tts_budget_ms: u32,
+    /// 다음 화면의 광클 · 다시 고침 수
+    pub rage_or_retry_count: u32,
+    /// Esc · Alt+←(뒤로 가기) 한 번으로 돌아왔다
+    pub clean_dismiss_key: bool,
+    /// 돌아온 뒤 부모 화면에서 다음 유효 동작을 했다
+    pub parent_progressed: bool,
+}
+
+impl PostPickContext {
+    /// 정상적인 확인 뒤 복귀인가: 머문 시간이 8초 + 읽는 시간 안이고, 광클 · 다시 고침이 없고, 한 번에 깨끗이 닫고, 부모 화면에서
+    /// 이어 갔다. 참이면 sign 0 (마찰 · 이탈로 세지 않고 이탈 분모에서 뺀다). 기본값은 거짓이라 예전 판정과 같다
+    #[inline]
+    pub fn is_benign_peek_and_return(&self) -> bool {
+        let limit_ms = 8_000u32.saturating_add(self.tts_budget_ms);
+        self.dwell_ms <= limit_ms && self.rage_or_retry_count == 0 && self.clean_dismiss_key && self.parent_progressed
+    }
 }
 
 /// 세션 하나의 고른 뒤 구간들: 선택 대조 사건마다 고른 순간부터 다른 페이지에 들어가거나 다른 선택을 할 때까지 같은 페이지에서
@@ -1032,6 +1070,7 @@ pub fn post_pick_windows(events: &[WebEvent], params: &BehaviorParams, policy: A
             friction: signals.friction(params),
             completed: sorted[i + 1..].iter().any(|f| f.kind == EventKind::Submit),
             abandoned: left_for_good || signals.events.iter().any(|s| matches!(s.signal, Signal::Abandoned)),
+            peek: false,
         });
     }
     out
@@ -1049,6 +1088,14 @@ pub const CROSS_BOUNDARY_HOP_DECAY: f64 = 0.85;
 /// 정상 전진 조작이 일어나기 전 8초(`CROSS_BOUNDARY_BOUNCE_MS`) 이내에 즉시 뒤로가기(`Backtracked`) ·
 /// 창 닫기 이탈(`Leave` / `Abandoned`) · 광클(`rage`)이 발생하면 `0.85 * F_arrival(S_2)` 를 출발지 선택지로 역귀속한다.
 pub fn post_pick_windows_v2(events: &[WebEvent], params: &BehaviorParams, policy: AbandonPolicy) -> Vec<PostPick> {
+    post_pick_windows_v2_with(events, params, policy, None)
+}
+
+/// [`post_pick_windows_v2`] 에 확인 뒤 복귀(PeekAndReturn) 면책을 켠 것. `peek_tts_budget_ms` 가 `Some(t)` 이면 다음 화면에서
+/// 곧바로 돌아온 구간을 [`PostPickContext`] 로 보고(머문 시간, 읽는 시간 `t`, 광클 · 다시 고침, 뒤로 가기 한 번, 돌아온 뒤 부모
+/// 화면의 다음 동작), 정상 행동이면 역귀속 마찰 · 이탈을 더하지 않고 [`PostPick::peek`] 를 켠다. 스크린리더 사용자는 첫 안내만
+/// 듣고 닫는 일이 잦아 `t` 를 읽은 글자 × `READING_MS_PER_CHAR` 로 준다. `None` 이면 [`post_pick_windows_v2`] 와 같다
+pub fn post_pick_windows_v2_with(events: &[WebEvent], params: &BehaviorParams, policy: AbandonPolicy, peek_tts_budget_ms: Option<u32>) -> Vec<PostPick> {
     let mut sorted: Vec<&WebEvent> = events.iter().collect();
     sorted.sort_by_key(|e| (e.seq, e.t_ms));
     let mut out = Vec::new();
@@ -1074,6 +1121,7 @@ pub fn post_pick_windows_v2(events: &[WebEvent], params: &BehaviorParams, policy
         let left_for_good = end == sorted.len() && window.iter().any(|f| f.kind == EventKind::Leave) && !submitted_here && !exempt_page;
         let mut friction = signals.friction(params);
         let mut abandoned = left_for_good || signals.events.iter().any(|s| matches!(s.signal, Signal::Abandoned));
+        let mut peek = false;
 
         // 1-Hop 역추적: 직후 다른 페이지 S_2 로 전이된 경우 도착 초기 8초 이내의 즉발 역류·이탈·광클을 역귀속한다.
         if let Some(first_next) = sorted.get(end) {
@@ -1085,15 +1133,23 @@ pub fn post_pick_windows_v2(events: &[WebEvent], params: &BehaviorParams, policy
                     let mut immediate_backtrack = false;
                     let mut immediate_leave = false;
                     let mut forward_progress = false;
-                    for f in &sorted[end..] {
+                    // 돌아온 사건의 자리 (sorted 의 번호)
+                    let mut returned_at: Option<usize> = None;
+                    let window_ms = CROSS_BOUNDARY_BOUNCE_MS + i64::from(peek_tts_budget_ms.unwrap_or(0));
+                    for (k, f) in sorted.iter().enumerate().skip(end) {
                         let dwell = f.t_ms - arrive_t;
-                        if dwell > CROSS_BOUNDARY_BOUNCE_MS {
+                        if dwell > window_ms {
                             break;
                         }
                         let f_page = nav::page_hash(&f.href);
                         if f_page.as_deref() == Some(page.as_str()) {
-                            immediate_backtrack = true;
+                            // 면책을 켜면 읽는 시간만큼 늘린 창 안의 복귀도 즉시 복귀다 (끄면 예전 8초 창 그대로)
+                            immediate_backtrack = dwell <= CROSS_BOUNDARY_BOUNCE_MS || peek_tts_budget_ms.is_some();
+                            returned_at = Some(k);
                             break;
+                        }
+                        if dwell > CROSS_BOUNDARY_BOUNCE_MS {
+                            continue;
                         }
                         if f_page.as_deref() != Some(next_page.as_str()) {
                             // 제3의 새 페이지로 정상 전진
@@ -1122,7 +1178,30 @@ pub fn post_pick_windows_v2(events: &[WebEvent], params: &BehaviorParams, policy
                         arrival_friction += params.abandoned;
                     }
                     let bounced = !forward_progress && (immediate_backtrack || (immediate_leave && !exempt_page) || has_hop_rage);
-                    if bounced {
+                    let benign = match (peek_tts_budget_ms, returned_at) {
+                        (Some(tts), Some(k)) if !immediate_leave && !forward_progress => {
+                            let back_now = sorted[k].kind == EventKind::Back;
+                            let backs_before = hop_events.iter().filter(|f| f.kind == EventKind::Back).count();
+                            let parent_progressed = sorted[k + 1..]
+                                .iter()
+                                .take_while(|g| nav::page_hash(&g.href).as_deref() == Some(page.as_str()))
+                                .find(|g| g.rage || matches!(g.kind, EventKind::Leave | EventKind::Back | EventKind::Click | EventKind::Change | EventKind::Submit))
+                                .is_some_and(|g| !g.rage && matches!(g.kind, EventKind::Click | EventKind::Change | EventKind::Submit));
+                            let rage_or_retry = hop_ep.events.iter().filter(|s| matches!(s.signal, Signal::RageClick | Signal::Retried)).count();
+                            PostPickContext {
+                                dwell_ms: u32::try_from((sorted[k].t_ms - arrive_t).max(0)).unwrap_or(u32::MAX),
+                                tts_budget_ms: tts,
+                                rage_or_retry_count: rage_or_retry as u32,
+                                clean_dismiss_key: back_now && backs_before == 0,
+                                parent_progressed,
+                            }
+                            .is_benign_peek_and_return()
+                        }
+                        _ => false,
+                    };
+                    if benign {
+                        peek = true;
+                    } else if bounced {
                         friction += CROSS_BOUNDARY_HOP_DECAY * arrival_friction;
                         abandoned = true;
                     }
@@ -1136,6 +1215,7 @@ pub fn post_pick_windows_v2(events: &[WebEvent], params: &BehaviorParams, policy
             friction,
             completed: sorted[i + 1..].iter().any(|f| f.kind == EventKind::Submit),
             abandoned,
+            peek,
         });
     }
     out
