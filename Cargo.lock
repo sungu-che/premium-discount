@@ -2270,6 +2270,7 @@ dependencies = [
  "memmap2",
  "premium-discount-cpu-kernels",
  "premium-discount-manifest",
+ "premium-discount-sds",
  "rayon",
  "serde",
  "serde_json",
@@ -2287,6 +2288,8 @@ dependencies = [
  "premium-discount-nms",
  "premium-discount-sds",
  "premium-discount-verdict",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

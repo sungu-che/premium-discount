@@ -480,7 +480,76 @@ impl UnitColdGuard {
         }
         (best_id, best_score, rescued, st)
     }
+
+    /// [`biased_cosine_argmax`](Self::biased_cosine_argmax) for scores on a calibrated scale
+    /// (`calibrate_knots(raw_cosine, knots)`, e.g. logis-center's `CLS_TO_LEGACY_COS`): the gate and the sector prior
+    /// are in calibrated units, the cluster bounds stay raw unit-sphere cosines.
+    ///
+    /// - `active_scores` are calibrated; `S_gate = best_active + beta_sector`.
+    /// - A cold row competes with `calibrate_knots(raw − delta_q4)` (`delta_q4`: the raw Q4 noise margin) and wins
+    ///   when that exceeds the gate (equal scores: lower id), exactly what a full scan with the same rule decides.
+    /// - A cold cluster is skipped only when `U_m(q) − delta_q4` is at or below a raw gate that is never above
+    ///   `f⁻¹(S_gate)` ([`uncalibrate_knots`] moved past f32 rounding), so no row the calibrated rule accepts is pruned.
+    ///   Comparing the raw bound with the calibrated gate itself would prune rows that pass.
+    ///
+    /// Returns `(id, calibrated score, rescued, stats)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn biased_cosine_argmax_calibrated(
+        &self,
+        active_scores: &[f32],
+        active_ids: &[u32],
+        q_unit: &[f32],
+        beta_sector: f32,
+        delta_q4: f32,
+        knots: &[(f32, f32)],
+        cold_cosine: impl Fn(u32) -> f32,
+    ) -> (u32, f32, bool, ArgmaxStats) {
+        let (mut best_id, mut best_active) = (u32::MAX, f32::NEG_INFINITY);
+        for (&s, &id) in active_scores.iter().zip(active_ids) {
+            if s > best_active || (s == best_active && id < best_id) {
+                best_active = s;
+                best_id = id;
+            }
+        }
+        let c = self.radius.len();
+        let mut bounds: Vec<(f32, usize)> = (0..c)
+            .map(|j| (self.cluster_upper_bound(j, q_unit), j))
+            .collect();
+        bounds.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut st = ArgmaxStats {
+            clusters: c,
+            ..Default::default()
+        };
+        let mut best_score = best_active;
+        let mut rescued = false;
+        let mut threshold = best_active + beta_sector;
+        let mut raw_gate = uncalibrate_knots_floor(threshold, knots);
+        for (ub, j) in bounds {
+            if ub - delta_q4 <= raw_gate {
+                break;
+            }
+            st.clusters_refined += 1;
+            for &id in &self.members[self.offsets[j] as usize..self.offsets[j + 1] as usize] {
+                st.rows_refined += 1;
+                let sc = cold_cosine(id);
+                let eff = calibrate_knots(sc - delta_q4, knots);
+                if eff > threshold || (eff == threshold && rescued && id < best_id) {
+                    threshold = eff;
+                    raw_gate = uncalibrate_knots_floor(threshold, knots);
+                    best_score = calibrate_knots(sc, knots);
+                    best_id = id;
+                    rescued = true;
+                }
+            }
+        }
+        (best_id, best_score, rescued, st)
+    }
 }
+
+/// Monotone calibration tables (`calibrate_knots` is logis-center's `interp_knots` arithmetic, bit for bit) and the
+/// inverse used by [`UnitColdGuard::biased_cosine_argmax_calibrated`]; they live in `premium-discount-sds::knots`
+/// so wasm32 crates (nms) share them.
+pub use premium_discount_sds::knots::{calibrate_knots, uncalibrate_knots, uncalibrate_knots_floor};
 
 #[cfg(test)]
 mod tests {
@@ -635,5 +704,102 @@ mod tests {
             }
         }
         assert!(pruned_trials > 50, "expected spherical pruning (pruned_trials={pruned_trials})");
+    }
+
+    /// A strictly increasing 27-knot quantile table (numbers of logis-center's granite → legacy cosine map).
+    const KNOTS_27: [(f32, f32); 27] = [
+        (-1.0000, -1.0000),
+        (0.6330, 0.1070),
+        (0.6540, 0.1710),
+        (0.6688, 0.2132),
+        (0.6869, 0.2716),
+        (0.7018, 0.3246),
+        (0.7091, 0.3520),
+        (0.7171, 0.3820),
+        (0.7291, 0.4234),
+        (0.7397, 0.4564),
+        (0.7527, 0.4921),
+        (0.7622, 0.5161),
+        (0.7705, 0.5359),
+        (0.7784, 0.5538),
+        (0.7865, 0.5714),
+        (0.7954, 0.5900),
+        (0.8065, 0.6117),
+        (0.8236, 0.6424),
+        (0.8394, 0.6692),
+        (0.8600, 0.7033),
+        (0.8755, 0.7300),
+        (0.8904, 0.7587),
+        (0.9259, 0.8304),
+        (0.9684, 0.9224),
+        (0.9915, 0.9710),
+        (0.9997, 0.9944),
+        (1.0000, 1.0000),
+    ];
+
+    #[test]
+    fn calibrated_cold_guard_never_prunes_a_row_the_full_scan_accepts() {
+        let k = &KNOTS_27;
+        let (n_cold, n_active, d) = (1200usize, 600usize, 32usize);
+        let mut s = 0xC0FFEE_u64;
+        let unit = |v: Vec<f32>| {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+            v.into_iter().map(|x| x / n).collect::<Vec<f32>>()
+        };
+        let cold_rows: Vec<Vec<f32>> = (0..n_cold).map(|_| unit((0..d).map(|_| rng(&mut s)).collect())).collect();
+        let active_rows: Vec<Vec<f32>> = (0..n_active).map(|_| unit((0..d).map(|_| rng(&mut s)).collect())).collect();
+        let cold_ids: Vec<u32> = (0..n_cold as u32).map(|i| 10_000 + i).collect();
+        let active_ids: Vec<u32> = (0..n_active as u32).collect();
+        let flat: Vec<f32> = cold_rows.iter().flatten().copied().collect();
+        let guard = build_unit_cold_guard(&flat, &cold_ids, d, 24, 4);
+        let (beta, delta) = (0.01f32, 0.005f32);
+        let (mut rescues, mut mismatches, mut pruned_rows) = (0usize, 0usize, 0usize);
+        for trial in 0..10_000 {
+            let mut q: Vec<f32> = (0..d).map(|_| rng(&mut s)).collect();
+            if trial % 2 == 0 {
+                // aim near a cold row so calibrated cold scores reach the steep upper knots
+                let t = &cold_rows[trial % n_cold];
+                let mix = 0.05 + 0.6 * (trial % 7) as f32 / 7.0;
+                q.iter_mut().zip(t).for_each(|(a, b)| *a = mix * *a + b);
+            }
+            let q = unit(q);
+            let active_scores: Vec<f32> = active_rows.iter().map(|r| calibrate_knots(dot(r, &q), k)).collect();
+            let cold_cos = |id: u32| dot(&cold_rows[(id - 10_000) as usize], &q);
+            let (id, score, rescued, st) =
+                guard.biased_cosine_argmax_calibrated(&active_scores, &active_ids, &q, beta, delta, k, cold_cos);
+            pruned_rows += n_cold - st.rows_refined;
+            // full scan with the same calibrated rule
+            let (mut best_id, mut best_active) = (u32::MAX, f32::NEG_INFINITY);
+            for (&sc, &aid) in active_scores.iter().zip(&active_ids) {
+                if sc > best_active || (sc == best_active && aid < best_id) {
+                    best_active = sc;
+                    best_id = aid;
+                }
+            }
+            let gate = best_active + beta;
+            let mut cand: Option<(f32, u32, f32)> = None;
+            for &cid in &cold_ids {
+                let raw = cold_cos(cid);
+                let eff = calibrate_knots(raw - delta, k);
+                if eff > gate && cand.is_none_or(|(e, i, _)| eff > e || (eff == e && cid < i)) {
+                    cand = Some((eff, cid, raw));
+                }
+            }
+            let want = match cand {
+                Some((_, cid, raw)) => (cid, calibrate_knots(raw, k), true),
+                None => (best_id, best_active, false),
+            };
+            if (id, score.to_bits(), rescued) != (want.0, want.1.to_bits(), want.2) {
+                mismatches += 1;
+            }
+            rescues += want.2 as usize;
+        }
+        eprintln!(
+            "calibrated cold guard: 10000 queries, mismatches {mismatches}, rescues {rescues}, cold rows pruned {:.1}%",
+            100.0 * pruned_rows as f64 / (10_000 * n_cold) as f64
+        );
+        assert_eq!(mismatches, 0, "false pruning or false rescue in 10,000 queries");
+        assert!(rescues >= 1_000 && 10_000 - rescues >= 1_000, "both outcomes are exercised: rescues={rescues}");
+        assert!(pruned_rows > 0, "the raw-space bound still prunes cold rows");
     }
 }

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 premium-discount-cpu-kernels.workspace = true
 premium-discount-manifest.workspace = true
+premium-discount-sds.workspace = true
 anyhow.workspace = true
 half.workspace = true
 memmap2.workspace = true
