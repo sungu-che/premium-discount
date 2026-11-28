@@ -146,6 +146,13 @@ impl ExpansionBudgetGuard {
         BudgetDecision::Expand(out)
     }
 
+    /// Whether a first sparse pass over `initial_open` of `total` cells already exceeds `max_total_ratio`
+    /// (e.g. after forced seeds were merged by [`initial_cells_2d_seeded`]); then one full pass is cheaper
+    /// than any sparse schedule and the caller should skip straight to it.
+    pub fn initial_over_budget(&self, total: usize, initial_open: usize) -> bool {
+        total > 0 && initial_open as f32 / total as f32 > self.cfg.max_total_ratio
+    }
+
     /// Plan 1D neighbor expansion (e.g. long-document paragraph grid or time-window grid).
     pub fn plan_1d(
         &self,
@@ -192,6 +199,27 @@ pub fn initial_cells_2d(
         }
     }
     out
+}
+
+/// [`initial_cells_2d`] united with forced `priority_seeds` (e.g. a predicted next target, cells that just changed,
+/// the last peak of a protected class), so small targets on the border never fall into a checkerboard hole.
+/// Seeds out of the grid or in `excluded` are dropped: excluded cells stay closed in every pass. Sorted, unique.
+pub fn initial_cells_2d_seeded(
+    rows: usize,
+    cols: usize,
+    pattern: PerforatePattern,
+    excluded: &[usize],
+    priority_seeds: &[usize],
+) -> Vec<usize> {
+    let total = rows.saturating_mul(cols);
+    let excl: BTreeSet<usize> = excluded.iter().copied().collect();
+    let mut keep: BTreeSet<usize> = initial_cells_2d(rows, cols, pattern, excluded).into_iter().collect();
+    for &s in priority_seeds {
+        if s < total && !excl.contains(&s) {
+            keep.insert(s);
+        }
+    }
+    keep.into_iter().collect()
 }
 
 /// Compute 1D strided initial indices (`i % stride == 0`) union `pinned` indices, skipping `excluded`.
@@ -307,6 +335,39 @@ mod tests {
         assert!((filled[1] - 0.2).abs() < 1e-6, "filled[1]={}", filled[1]);
         // Hole at idx 7 (neighbors: 4=0.5, 6=0.1, 8=0.3) must get min=0.1
         assert!((filled[7] - 0.1).abs() < 1e-6, "filled[7]={}", filled[7]);
+    }
+
+    #[test]
+    fn seeded_initial_cells_open_every_valid_seed_and_never_an_excluded_cell() {
+        // 8 × 8 checkerboard: border cell 7 (row 0, col 7) and 56 (row 7, col 0) are holes of the plain pattern
+        let plain = initial_cells_2d(8, 8, PerforatePattern::Checker, &[3]);
+        assert!(!plain.contains(&7) && !plain.contains(&56));
+        let seeded = initial_cells_2d_seeded(8, 8, PerforatePattern::Checker, &[3, 56], &[7, 56, 3, 999]);
+        assert!(seeded.contains(&7), "a valid seed is always opened");
+        assert!(!seeded.contains(&56) && !seeded.contains(&3), "excluded seeds stay closed");
+        assert!(seeded.windows(2).all(|w| w[0] < w[1]), "sorted and unique");
+        assert_eq!(seeded.len(), plain.len() + 1);
+        // no seeds: identical to the plain pattern
+        assert_eq!(initial_cells_2d_seeded(8, 8, PerforatePattern::Fovea { border_ring: 2 }, &[], &[]),
+                   initial_cells_2d(8, 8, PerforatePattern::Fovea { border_ring: 2 }, &[]));
+        assert!(initial_cells_2d_seeded(0, 5, PerforatePattern::Checker, &[], &[0]).is_empty());
+    }
+
+    #[test]
+    fn seeds_that_push_the_first_pass_over_budget_mean_one_full_pass() {
+        let guard = ExpansionBudgetGuard::default();
+        // Fovea(2) on 6 × 6 opens the 2 × 2 core + half the ring = 20 / 36 ≈ 0.56 ≤ 0.65
+        let base = initial_cells_2d(6, 6, PerforatePattern::Fovea { border_ring: 2 }, &[]);
+        assert!(!guard.initial_over_budget(36, base.len()), "{} / 36", base.len());
+        // five forced ring seeds lift it to 25 / 36 ≈ 0.69 > 0.65
+        let holes: Vec<usize> = (0..36).filter(|i| !base.contains(i)).take(5).collect();
+        let seeded = initial_cells_2d_seeded(6, 6, PerforatePattern::Fovea { border_ring: 2 }, &[], &holes);
+        assert_eq!(seeded.len(), base.len() + 5);
+        assert!(guard.initial_over_budget(36, seeded.len()));
+        assert!(!guard.initial_over_budget(0, 0));
+        // and the second-pass planner agrees once anything more would be opened
+        // (seed 35 = row 5, col 5 still has closed neighbours 29 and 34)
+        assert_eq!(guard.plan_2d(6, 6, &seeded, &[35], &[], &[], 0), BudgetDecision::FallbackFull);
     }
 
     #[test]

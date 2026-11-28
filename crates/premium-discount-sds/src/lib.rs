@@ -12,6 +12,7 @@
 //! * [`ledger`] – [`Ledger`]: 저장된 바탕 + 이번 실행의 관측(프로세스마다 실행 파일 하나), secondary → primary →
 //!   global → unscoped 백오프 읽기, 혼동 동점 깨기, 전이 사전확률.
 //! * [`matrix`] – 이중 센터링과 마진 순 1:1 배정(동점 모양은 부르는 쪽이 정함).
+//! * [`knots`]  – 단조 구간 선형 보정표와 그 역변환: 보정 눈금의 문턱을 원시 점수에 그대로 쓰게 한다.
 //!
 //! 전역 상태가 없다: [`Ledger`] 는 평범한 값(`Send + Sync`)이고, 함께 쓰려면 `Mutex` / `RwLock` 뒤에 둔다.
 //! 표본이 모자라면 판정하지 않는다 — 단계가 [`MinObs`] 를 채우기 전에는 읽기가 모두 `None` 이다.
@@ -19,6 +20,7 @@
 #[cfg(feature = "audit")]
 pub mod audit;
 pub mod geometry;
+pub mod knots;
 pub mod ledger;
 pub mod matrix;
 pub mod moments;

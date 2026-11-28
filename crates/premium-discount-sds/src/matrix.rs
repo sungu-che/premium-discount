@@ -69,6 +69,25 @@ pub fn double_center(raw: &[Vec<f32>]) -> Vec<Vec<f32>> {
     out
 }
 
+/// [`double_center`] that never wipes a lone candidate. A single present row or column is already centred on
+/// its own mean there (1-D), so the one shape that degenerates is a lone present cell: `v − v − v + v = 0.0`.
+/// That cell keeps its raw value here; every other matrix gets exactly [`double_center`]. Absent cells stay
+/// [`ABSENT`].
+pub fn double_center_guarded(raw: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    let present = |v: f32| v.is_finite() && v >= 0.0;
+    let mut cells = raw
+        .iter()
+        .enumerate()
+        .flat_map(|(f, row)| row.iter().enumerate().filter(|&(_, &v)| present(v)).map(move |(l, &v)| (f, l, v)));
+    if let (Some((f, l, v)), None) = (cells.next(), cells.next()) {
+        let line_count = raw.iter().map(Vec::len).max().unwrap_or(0);
+        let mut out = vec![vec![ABSENT; line_count]; raw.len()];
+        out[f][l] = v;
+        return out;
+    }
+    double_center(raw)
+}
+
 /// Shape of one line's competition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TieKind {
@@ -197,7 +216,8 @@ pub fn exclusive_assign_by_score(matrix: &[Vec<f32>], abs_threshold: f32, margin
 
 /// Competition shape of `line`: `(kind, top field, second field, top1 − top2, noise)` where noise is the σ of the
 /// tail (2nd place and below) among cells reaching `abs_threshold`. `None` below three candidates (no noise
-/// estimate; callers keep the plain margin rule). A tail without spread is [`TieKind::Decisive`] with noise 0.
+/// estimate; callers keep the plain margin rule). A tail without spread has noise 0: [`TieKind::Decisive`] when the
+/// top stands above it, [`TieKind::Flat`] when every candidate is level.
 pub fn line_tie_shape(matrix: &[Vec<f32>], line: usize, abs_threshold: f32) -> Option<(TieKind, usize, usize, f32, f32)> {
     let mut cands: Vec<(usize, f32)> = Vec::new();
     for (f, row) in matrix.iter().enumerate() {
@@ -219,7 +239,9 @@ pub fn line_tie_shape(matrix: &[Vec<f32>], line: usize, abs_threshold: f32) -> O
     let var = tail.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
     let noise = var.max(0.0).sqrt();
     if noise <= 1e-6 {
-        return Some((TieKind::Decisive, cands[0].0, cands[1].0, m12, 0.0));
+        // A tail without spread: decisive when the top stands above it, a flat tie when it does not (every field level).
+        let kind = if m12 > 1e-6 { TieKind::Decisive } else { TieKind::Flat };
+        return Some((kind, cands[0].0, cands[1].0, m12, 0.0));
     }
     let kind = if m12 >= noise {
         TieKind::Decisive
@@ -276,6 +298,29 @@ mod tests {
 
     fn near(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn guarded_double_center_keeps_a_lone_candidate_and_matches_elsewhere() {
+        // two or more present rows and columns: exactly double_center
+        let full = vec![vec![0.9, 0.9, 0.9], vec![0.6, 0.2, 0.2], vec![0.2, 0.2, 0.6]];
+        assert_eq!(double_center_guarded(&full), double_center(&full));
+        // a single row or column: centred on its own mean, as double_center already does
+        let row = vec![vec![0.7, 0.4, ABSENT, 0.1]];
+        assert_eq!(double_center_guarded(&row), double_center(&row));
+        assert!(near(double_center_guarded(&row)[0][0], 0.3), "{:?}", double_center_guarded(&row));
+        let col = vec![vec![0.5], vec![0.9]];
+        assert_eq!(double_center_guarded(&col), double_center(&col));
+        // a lone present cell: double_center turns it into 0.0, the guard keeps it
+        let lone = vec![vec![0.83]];
+        assert_eq!(double_center(&lone)[0][0], 0.0);
+        assert_eq!(double_center_guarded(&lone), vec![vec![0.83]]);
+        let sparse = vec![vec![ABSENT, ABSENT], vec![ABSENT, 0.61], vec![ABSENT, ABSENT]];
+        assert_eq!(double_center(&sparse)[1][1], 0.0);
+        let g = double_center_guarded(&sparse);
+        assert_eq!(g[1][1], 0.61);
+        assert!(g.iter().flatten().filter(|&&v| v != 0.61).all(|&v| v == ABSENT));
+        assert!(double_center_guarded(&[]).is_empty());
     }
 
     #[test]
@@ -371,6 +416,9 @@ mod tests {
         );
         let uniform = line_tie_shape(&column(&[0.9, 0.5, 0.5]), 0, 0.0).unwrap();
         assert_eq!((uniform.0, uniform.4), (TieKind::Decisive, 0.0));
+        // every candidate level (e.g. same-label cells with no other context): a flat tie, not a decisive top
+        let level = line_tie_shape(&column(&[0.0, 0.0, 0.0, 0.0]), 0, 0.0).unwrap();
+        assert_eq!((level.0, level.3, level.4), (TieKind::Flat, 0.0, 0.0));
         assert_eq!(
             line_tie_shape(&column(&[0.9, 0.5, -0.2]), 0, 0.0),
             None,
