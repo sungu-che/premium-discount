@@ -40,6 +40,7 @@ url = "2"
 # premium-discount 의 crate (tokio · LanceDB · candle 없이 wasm32 로 빌드되는 것만)
 premium-discount-identity = { path = "../crates/premium-discount-identity" }
 premium-discount-verdict = { path = "../crates/premium-discount-verdict" }
+premium-discount-nav = { path = "../crates/premium-discount-nav" }
 premium-discount-worker-common = { path = "common" }
 
 [profile.release]

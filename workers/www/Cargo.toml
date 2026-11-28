@@ -15,6 +15,8 @@ premium-discount-worker-common.workspace = true
 premium-discount-identity.workspace = true
 # RECIPE (판정 행이 없는 평가에 붙이는 규칙 이름, evaluations.rs) — 원본은 cron/src/verdict.ts 의 RECIPE
 premium-discount-verdict.workspace = true
+# 4-쿼터 포트폴리오 (GET /nav/trials v2): 앱과 같은 규칙 (Quota C 에 대체 · discount 코스 없음)
+premium-discount-nav.workspace = true
 indexmap.workspace = true
 url.workspace = true
 hmac.workspace = true

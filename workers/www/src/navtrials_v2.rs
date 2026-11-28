@@ -34,12 +34,8 @@ pub const SERVER_DUEL_MIN_MARGIN: f64 = 0.08;
 /// Phase 5 Part 1: 14일 반감기 에폭 단위.
 pub const EPOCH_DAYS: i64 = 14;
 
-/// Phase 5 Part 2 + Phase 7 Part 4: 4-쿼터 다양성 포트폴리오 슬롯 상한.
-pub const QUOTA_ENTRY: usize = 6;
-pub const QUOTA_ELITE: usize = 6;
-pub const QUOTA_POPULAR: usize = 6;
-pub const QUOTA_ACCESSIBLE: usize = 4;
-pub const PER_GOAL_CAP: usize = 2;
+/// Phase 5 Part 2 + Phase 7 Part 4: 4-쿼터 다양성 포트폴리오 슬롯 상한 (premium-discount-nav 의 값)
+pub use premium_discount_nav::{PER_GOAL_CAP, QUOTA_ACCESSIBLE, QUOTA_ELITE, QUOTA_ENTRY, QUOTA_POPULAR};
 
 /// Phase 7 Part 4: 코스 물리 조작 요구 특성 비트.
 pub const TRAIT_NO_FINE_GESTURE: u32 = 1 << 0;
@@ -399,79 +395,33 @@ pub struct PortfolioCourse {
     pub superseded: bool,
 }
 
-/// 4-쿼터 다양성 포트폴리오 선발 (`GET /nav/trials v2`, Phase 5 Part 2 + Phase 7 Part 4):
-/// * Quota A (진입 맥락, 최대 6): `start_cp == entry_cp`
-/// * Quota B (고속 정예, 최대 6): `tier == "premium" && !superseded`, `pace_ms ASC, grade DESC`
-/// * Quota D (포용 접근성 표준, 최대 4): `TRAIT_NO_FINE_GESTURE | TRAIT_TREE_ACCESSIBLE`, 비함정 우선
-/// * Quota C (대중 기준선, 최대 6) + 내 콜렉션(`mine_ids`) 보충
-/// 동일 `(start_cp, goal_cp)` 독점 방지를 위해 1차 패스에서 쌍당 최대 2개(`PER_GOAL_CAP`)를 제한한다.
+/// 4-쿼터 다양성 포트폴리오 선발 (`GET /nav/trials v2`): 규칙은 premium-discount-nav 의
+/// [`premium_discount_nav::select_stratified_portfolio`] 하나다(앱과 같은 규칙).
+/// * Quota A (진입 맥락, 최대 6) · Quota B (고속 정예, 최대 6) · Quota D (포용 접근성 표준, 최대 4) · Quota C (대중 기준선, 최대 6) + 내 코스
+/// * Quota C 는 대체(superseded)된 코스와 discount 코스를 받지 않는다(좀비 코스 유입 막기)
 pub fn select_stratified_portfolio(candidates: &[PortfolioCourse], entry_cp: Option<&str>, mine_ids: &[String]) -> Vec<String> {
-    let mut selected: Vec<String> = Vec::new();
-    let mut picked: HashSet<String> = HashSet::new();
-    let mut pair_counts: HashMap<(String, String), usize> = HashMap::new();
-
-    let mut try_take = |list: &[&PortfolioCourse], limit: usize, enforce_cap: bool| {
-        let mut taken = 0usize;
-        for c in list {
-            if taken >= limit {
-                break;
-            }
-            if picked.contains(&c.course) {
-                continue;
-            }
-            let pair = (c.start_cp.clone(), c.goal_cp.clone());
-            if enforce_cap && *pair_counts.get(&pair).unwrap_or(&0) >= PER_GOAL_CAP {
-                continue;
-            }
-            picked.insert(c.course.clone());
-            *pair_counts.entry(pair).or_insert(0) += 1;
-            selected.push(c.course.clone());
-            taken += 1;
-        }
+    use premium_discount_verdict::Tier;
+    let tier = |t: &str| match t {
+        "premium" => Tier::Premium,
+        "discount" => Tier::Discount,
+        "neutral" => Tier::Neutral,
+        _ => Tier::Unrated,
     };
-
-    // Quota A: Entry-Matched
-    if let Some(entry) = entry_cp.filter(|e| !e.is_empty()) {
-        let mut qa: Vec<&PortfolioCourse> = candidates.iter().filter(|c| c.start_cp == entry && !c.superseded).collect();
-        qa.sort_by(|a, b| {
-            let pa = i32::from(a.tier == "premium");
-            let pb = i32::from(b.tier == "premium");
-            pb.cmp(&pa).then(b.grade.cmp(&a.grade)).then(a.pace_ms.total_cmp(&b.pace_ms))
-        });
-        try_take(&qa, QUOTA_ENTRY, true);
-    }
-
-    // Quota B: Elite-Shortcut (Premium non-superseded fastest pace)
-    let mut qb: Vec<&PortfolioCourse> = candidates.iter().filter(|c| c.tier == "premium" && !c.superseded).collect();
-    qb.sort_by(|a, b| a.pace_ms.total_cmp(&b.pace_ms).then(b.grade.cmp(&a.grade)).then(a.course.cmp(&b.course)));
-    try_take(&qb, QUOTA_ELITE, true);
-
-    // Quota D: Accessible-Viable (NO_FINE_GESTURE | TREE_ACCESSIBLE, non-discount)
-    let req_mask = TRAIT_NO_FINE_GESTURE | TRAIT_TREE_ACCESSIBLE;
-    let mut qd: Vec<&PortfolioCourse> = candidates
+    let cands: Vec<premium_discount_nav::PortfolioCourse> = candidates
         .iter()
-        .filter(|c| (c.interaction_traits & req_mask) == req_mask && c.tier != "discount" && !c.superseded)
+        .map(|c| premium_discount_nav::PortfolioCourse {
+            course: c.course.clone(),
+            start_cp: c.start_cp.clone(),
+            goal_cp: c.goal_cp.clone(),
+            runs: c.runs,
+            tier: tier(&c.tier),
+            grade: c.grade,
+            pace_ms: c.pace_ms,
+            interaction_traits: (c.interaction_traits & u32::from(u16::MAX)) as u16,
+            superseded: c.superseded,
+        })
         .collect();
-    qd.sort_by(|a, b| {
-        let pa = i32::from(a.tier == "premium");
-        let pb = i32::from(b.tier == "premium");
-        pb.cmp(&pa).then(b.grade.cmp(&a.grade)).then(a.pace_ms.total_cmp(&b.pace_ms))
-    });
-    try_take(&qd, QUOTA_ACCESSIBLE, false);
-
-    // Quota C: Popular baseline
-    let mut qc: Vec<&PortfolioCourse> = candidates.iter().collect();
-    qc.sort_by(|a, b| b.runs.total_cmp(&a.runs).then(a.course.cmp(&b.course)));
-    try_take(&qc, QUOTA_POPULAR, false);
-
-    // Mine supplement (always include user's own published courses)
-    for m in mine_ids {
-        if !picked.contains(m) && candidates.iter().any(|c| &c.course == m) {
-            picked.insert(m.clone());
-            selected.push(m.clone());
-        }
-    }
-    selected
+    premium_discount_nav::select_stratified_portfolio(&cands, entry_cp, mine_ids)
 }
 
 /// Phase 5 Part 2: `duplicate: true` 재주행자가 무마찰(`kind != -1`)로 종전 대표 기록보다 200ms 이상 단축했을 때
@@ -883,6 +833,8 @@ mod tests {
         assert!(selected.contains(&"elite-fast".to_string()), "Quota B must rescue elite shortcut");
         assert!(selected.contains(&"boss-entry".to_string()), "Quota A must deliver ?entry= matched course");
         assert!(selected.contains(&"accessible-clean".to_string()), "Quota D must deliver accessible-viable course");
+        // Quota C 는 대체 · discount 코스를 받지 않는다: 12개 함정 코스(discount)는 하나도 들어오지 않는다
+        assert!(selected.iter().all(|c| !c.starts_with("pop-")), "{selected:?}");
     }
 
     #[test]

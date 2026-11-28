@@ -6,7 +6,7 @@
 //! O(D) 벡터 연산으로 계산한다.
 
 use premium_discount_verdict::{
-    judge_in, Baselines, Context, Level, Math, Params, Prev, TrackParams, Verdict, IMPLICIT, NAV, RECIPE_V2,
+    effective_half_life_ms, judge_in, AdaptiveHalfLifeCfg, Baselines, Context, Level, Math, Params, Prev, TrackParams, Verdict, IMPLICIT, NAV, RECIPE_V2,
 };
 
 pub const NAV_RECIPE: &str = RECIPE_V2;
@@ -25,14 +25,18 @@ pub struct DailyBucket {
     pub down: u32,
 }
 
-/// Phase 5 Part 1: `|drift_z| > 1.5` 일 때 nav 트랙 반감기(14일)를 동적으로 압축한다(하한 2일).
+/// 스윕의 반감기 매개변수 ([`effective_half_life_ms`]): `|drift_z| ≥ 1.5` 이면 `H / (1 + 1.2 (|z| − 1.5))`, 하한 2일.
+/// 휴지기 연장(활성 비율)은 쓰지 않는다 (활성 비율 1.0: 지금의 판정 값을 그대로 둔다)
+pub const NAV_HALF_LIFE_CFG: AdaptiveHalfLifeCfg = AdaptiveHalfLifeCfg {
+    drift_z_trigger: NAV_DRIFT_TRIGGER_Z,
+    drift_gamma: NAV_DRIFT_GAMMA,
+    min_drift_half_life_ms: NAV_MIN_HALF_LIFE_MS,
+    max_dormant_half_life_ms: 45.0 * DAY_MS,
+};
+
+/// Phase 5 Part 1: `|drift_z| ≥ 1.5` 일 때 nav 트랙 반감기(14일)를 동적으로 압축한다(하한 2일).
 pub fn adaptive_nav_half_life_ms(base_half_life_ms: f64, drift_z: f64) -> f64 {
-    let excess = if drift_z.is_finite() {
-        (drift_z.abs() - NAV_DRIFT_TRIGGER_Z).max(0.0)
-    } else {
-        0.0
-    };
-    (base_half_life_ms / (1.0 + NAV_DRIFT_GAMMA * excess)).max(NAV_MIN_HALF_LIFE_MS)
+    effective_half_life_ms(base_half_life_ms, drift_z.is_finite().then_some(drift_z), 1.0, &NAV_HALF_LIFE_CFG)
 }
 
 /// 일별 버킷의 과거 구간 대비 최근 구간 순부호 급변(`drift_z`)을 산출한다.

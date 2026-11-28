@@ -18,6 +18,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.105"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cb931c189b85683d69a5cfad41d4d418671e1ac413dd209f3f2fc31e3cfd902"
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -664,6 +670,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "premium-discount-nav"
+version = "0.1.0"
+dependencies = [
+ "premium-discount-identity",
+ "premium-discount-sds",
+ "premium-discount-verdict",
+ "serde",
+]
+
+[[package]]
+name = "premium-discount-sds"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "zeroize",
+]
+
+[[package]]
 name = "premium-discount-verdict"
 version = "0.1.0"
 dependencies = [
@@ -703,6 +729,7 @@ dependencies = [
  "js-sys",
  "k256",
  "premium-discount-identity",
+ "premium-discount-nav",
  "premium-discount-verdict",
  "premium-discount-worker-common",
  "regex",
@@ -1267,6 +1294,20 @@ name = "zeroize"
 version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85ccff8a4805aba1eaa4cd4afcd49f7557dd2cf5fd79ffc37f8959466effc5aa"
+dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "zerotrie"
