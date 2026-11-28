@@ -85,6 +85,65 @@ pub fn ece(probs: &[f32], hits: &[bool], bins: usize) -> Option<f32> {
     Some(e as f32)
 }
 
+/// One label's ranking and calibration quality in a [`MultilabelRankBook`]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LabelRank {
+    pub n: usize,
+    pub positives: usize,
+    pub auroc: Option<f32>,
+    pub average_precision: Option<f32>,
+    /// [`ECE_BINS`]-bin expected calibration error of the scores read as probabilities (clamped to 0 ..= 1)
+    pub ece: Option<f32>,
+}
+
+/// Multi-label AUROC · AP · 15-bin ECE: per label, their macro means over the labels where each is defined, and the
+/// pooled (micro) values over every row
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MultilabelRankBook {
+    pub labels: BTreeMap<String, LabelRank>,
+    pub macro_auroc: Option<f32>,
+    pub macro_average_precision: Option<f32>,
+    pub macro_ece: Option<f32>,
+    pub micro_auroc: Option<f32>,
+    pub micro_average_precision: Option<f32>,
+    pub micro_ece: Option<f32>,
+}
+
+fn mean_of(values: impl Iterator<Item = Option<f32>>) -> Option<f32> {
+    let v: Vec<f32> = values.flatten().collect();
+    (!v.is_empty()).then(|| v.iter().sum::<f32>() / v.len() as f32)
+}
+
+/// Rank book of `rows = (label, score, hit)`: one row per (item, label) decision. A label with only positives or only
+/// negatives has no AUROC / AP (None), and the macro means skip it.
+pub fn evaluate_multilabel_rank_book(rows: &[(&str, f32, bool)]) -> MultilabelRankBook {
+    let mut by_label: BTreeMap<&str, (Vec<f32>, Vec<bool>)> = BTreeMap::new();
+    for &(label, score, hit) in rows {
+        let e = by_label.entry(label).or_default();
+        e.0.push(score);
+        e.1.push(hit);
+    }
+    let rank = |scores: &[f32], hits: &[bool]| LabelRank {
+        n: scores.len(),
+        positives: hits.iter().filter(|h| **h).count(),
+        auroc: auroc(scores, hits),
+        average_precision: average_precision(scores, hits),
+        ece: ece(scores, hits, ECE_BINS),
+    };
+    let labels: BTreeMap<String, LabelRank> = by_label.iter().map(|(l, (s, h))| (l.to_string(), rank(s, h))).collect();
+    let scores: Vec<f32> = rows.iter().map(|r| r.1).collect();
+    let hits: Vec<bool> = rows.iter().map(|r| r.2).collect();
+    MultilabelRankBook {
+        macro_auroc: mean_of(labels.values().map(|r| r.auroc)),
+        macro_average_precision: mean_of(labels.values().map(|r| r.average_precision)),
+        macro_ece: mean_of(labels.values().map(|r| r.ece)),
+        micro_auroc: auroc(&scores, &hits),
+        micro_average_precision: average_precision(&scores, &hits),
+        micro_ece: ece(&scores, &hits, ECE_BINS),
+        labels,
+    }
+}
+
 fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -273,6 +332,34 @@ pub fn fit_label(scores: &[f32], hits: &[bool], precision: f32, fpr: f32) -> Opt
         precision: (tp + fp > 0).then(|| tp as f32 / (tp + fp) as f32),
         recall: (positives > 0).then(|| tp as f32 / positives as f32),
     })
+}
+
+#[cfg(test)]
+mod multilabel_tests {
+    use super::*;
+
+    #[test]
+    fn the_rank_book_scores_each_label_and_skips_undefined_ones_in_the_macro_mean() {
+        let rows = [
+            ("a", 0.9, true),
+            ("a", 0.8, true),
+            ("a", 0.2, false),
+            ("b", 0.7, false),
+            ("b", 0.6, true),
+            ("b", 0.1, false),
+            ("c", 0.5, true), // only positives: no AUROC / AP
+        ];
+        let book = evaluate_multilabel_rank_book(&rows);
+        assert_eq!(book.labels.len(), 3);
+        assert_eq!(book.labels["a"].auroc, Some(1.0));
+        assert_eq!(book.labels["b"].auroc, Some(0.5));
+        assert_eq!(book.labels["c"].auroc, None);
+        assert_eq!((book.labels["c"].n, book.labels["c"].positives), (1, 1));
+        assert_eq!(book.macro_auroc, Some(0.75), "a and b only");
+        assert!(book.micro_auroc.is_some() && book.macro_ece.is_some());
+        let empty = evaluate_multilabel_rank_book(&[]);
+        assert!(empty.labels.is_empty() && empty.macro_auroc.is_none() && empty.micro_ece.is_none());
+    }
 }
 
 #[cfg(test)]
