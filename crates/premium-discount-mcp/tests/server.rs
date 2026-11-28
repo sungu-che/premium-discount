@@ -548,3 +548,22 @@ fn nav_number_applies_the_privacy_shield() {
     // No privacy arguments: clear, exactly as before.
     assert_eq!(premium_discount_mcp::server::nav_number(&nav_screen(false)).unwrap()["shield"], "clear");
 }
+
+#[test]
+fn nav_number_hides_only_an_inline_sensitive_cell() {
+    // a sensitive field locks the screen …
+    let n = premium_discount_mcp::server::nav_number(&nav_screen(true)).unwrap();
+    assert_eq!((n["sensitive"].as_bool(), n["record"].as_bool()), (Some(true), Some(false)));
+    // … unless the host marks it as one sensitive cell: only that spot is hidden and the rest is recorded
+    let mut args = nav_screen(true);
+    args["inline_redaction_zones"] = json!([{"x": 0.09, "y": 0.49, "w": 0.32, "h": 0.10, "kind": "sensitive_document_cell"}]);
+    let n = premium_discount_mcp::server::nav_number(&args).unwrap();
+    assert_eq!((n["sensitive"].as_bool(), n["record"].as_bool()), (Some(false), Some(true)), "{n}");
+    let anchors: Vec<&str> = n["regions"].as_array().unwrap().iter().map(|r| r["region"]["anchor"].as_str().unwrap()).collect();
+    assert!(!anchors.contains(&"pw"), "{anchors:?}");
+    assert!(anchors.contains(&"link:help") && anchors.contains(&"btn:login"), "{anchors:?}");
+    assert!(n["shield"]["partial_redaction"]["zones"].is_array());
+    // a window-level signal still locks everything
+    args["os_capture_protected"] = json!(true);
+    assert_eq!(premium_discount_mcp::server::nav_number(&args).unwrap()["shield"]["full_lockdown"], "display_affinity_protected");
+}

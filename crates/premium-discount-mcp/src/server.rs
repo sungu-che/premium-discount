@@ -487,6 +487,19 @@ struct NavInput {
     tiers: std::collections::HashMap<String, premium_discount_verdict::Tier>,
     iou: f32,
     shield: premium_discount_nav::PrivacyShield,
+    /// The host's inline redaction zones (a secret line, a sensitive cell): only those spots are hidden
+    inline: Vec<premium_discount_nav::InlineRedactionZone>,
+}
+
+/// One `inline_redaction_zones` item: `{x, y, w, h, kind}` (kind `inline_secret_line` by default)
+fn nav_inline_zone(v: &Value) -> Option<premium_discount_nav::InlineRedactionZone> {
+    use premium_discount_nav::RedactionKind;
+    let kind = match v.get("kind").and_then(Value::as_str).unwrap_or("inline_secret_line") {
+        "os_notification_toast" => RedactionKind::OsNotificationToast,
+        "sensitive_document_cell" => RedactionKind::SensitiveDocumentCell,
+        _ => RedactionKind::InlineSecretLine,
+    };
+    Some(premium_discount_nav::InlineRedactionZone { rect: nav_rect(v)?, kind })
 }
 
 fn nav_rect(v: &Value) -> Option<premium_discount_nav::Rect> {
@@ -532,7 +545,9 @@ fn nav_input(args: &Value) -> Result<NavInput> {
     let zones: Vec<premium_discount_nav::Rect> =
         args.get("os_notification_zones").and_then(Value::as_array).into_iter().flatten().filter_map(nav_rect).collect();
     let flag = |k: &str| args.get(k).and_then(Value::as_bool).unwrap_or(false);
-    let shield = premium_discount_nav::evaluate_privacy(&premium_discount_nav::PrivacyProbeInput {
+    let inline: Vec<premium_discount_nav::InlineRedactionZone> =
+        args.get("inline_redaction_zones").and_then(Value::as_array).into_iter().flatten().filter_map(nav_inline_zone).collect();
+    let probe = premium_discount_nav::PrivacyProbeInput {
         regions: &regions,
         os_capture_protected: flag("os_capture_protected"),
         os_overlay_payment_detected: flag("os_overlay_payment_detected"),
@@ -540,8 +555,9 @@ fn nav_input(args: &Value) -> Result<NavInput> {
         vision_privacy_hit: flag("vision_privacy_hit"),
         seed_phrase_detected: flag("seed_phrase_detected"),
         auth_or_payment_context: flag("auth_or_payment_context"),
-    });
-    Ok(NavInput { regions, dropped, tiers, iou, shield })
+    };
+    let shield = premium_discount_nav::evaluate_privacy_inline(&probe, &inline);
+    Ok(NavInput { regions, dropped, tiers, iou, shield, inline })
 }
 
 fn nav_output(numbered: Vec<premium_discount_nav::Numbered>, sensitive: bool, dropped: usize, shield: &premium_discount_nav::PrivacyShield) -> Value {
@@ -565,10 +581,13 @@ fn nav_output(numbered: Vec<premium_discount_nav::Numbered>, sensitive: bool, dr
 /// keypad or OTP row in the regions, or the host's window / vision signals (`os_capture_protected`,
 /// `os_overlay_payment_detected`, `vision_privacy_hit`, `seed_phrase_detected`, `auth_or_payment_context`) lock it the
 /// same way (`shield: {full_lockdown: <trigger>}`); `os_notification_zones` only drop the candidates under a toast
-/// (`shield: {partial_redaction: …}`, still recorded). Without those arguments the result is what it always was.
+/// (`shield: {partial_redaction: …}`, still recorded). `inline_redaction_zones` (`{x, y, w, h, kind}`, kind
+/// `inline_secret_line` | `sensitive_document_cell`) hide only that line or cell: a sensitive candidate under one does
+/// not make the screen sensitive. Without those arguments the result is what it always was.
 pub fn nav_number(args: &Value) -> Result<Value> {
     let input = nav_input(args)?;
-    let sensitive = premium_discount_nav::sensitive_screen(&input.regions) || matches!(input.shield, premium_discount_nav::PrivacyShield::FullLockdown(_));
+    let under_inline = |r: &premium_discount_nav::Region| input.inline.iter().any(|z| r.rect.containment(&z.rect) > 0.0);
+    let sensitive = input.regions.iter().any(|r| r.sensitive && !under_inline(r)) || matches!(input.shield, premium_discount_nav::PrivacyShield::FullLockdown(_));
     let regions = input.shield.redact(input.regions);
     let merged = premium_discount_nav::merge(regions, input.iou);
     let numbered = premium_discount_nav::number(merged, &input.tiers);
@@ -695,6 +714,7 @@ impl<B: Backend> ToolHandler for PdSyncServer<B> {
                     "os_capture_protected": {"type": "boolean", "description": "Privacy: a capture-protected window (WDA) is visible on the captured monitor → full lockdown"},
                     "os_overlay_payment_detected": {"type": "boolean", "description": "Privacy: a payment overlay window is visible → full lockdown"},
                     "os_notification_zones": {"type": "array", "items": {"type": "object"}, "description": "Privacy: notification toasts ({x,y,w,h}, window-relative): candidates under them are dropped"},
+                    "inline_redaction_zones": {"type": "array", "items": {"type": "object"}, "description": "Privacy: a secret line or a sensitive cell ({x,y,w,h,kind}, kind inline_secret_line | sensitive_document_cell): only that spot is hidden, the rest is still numbered and recorded"},
                     "vision_privacy_hit": {"type": "boolean", "description": "Privacy: the screen encoder saw a privacy domain → full lockdown"},
                     "seed_phrase_detected": {"type": "boolean", "description": "Privacy: a seed phrase is in the title / URL → full lockdown"},
                     "auth_or_payment_context": {"type": "boolean", "description": "Privacy: the page is a login / payment flow (lets an unlabeled digit grid count as a security keypad)"},
