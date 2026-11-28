@@ -419,6 +419,92 @@ pub fn baseline_of(values: &[f64]) -> Baseline {
     }
 }
 
+/// 관측을 만드는 쪽(-nav · -analytic · 로컬 코칭)이 [`Obs::credit`] 에 넣는 표준 몫.
+///
+/// 판정 수식과 [`Params::v1`] · [`Params::v2`] 는 그대로다. 가감점은 이 몫과 철회(`sign` 0)로만 조절하므로 recipe ·
+/// 계약이 바뀌지 않는다. 1 보다 큰 값은 검증된 근거를 관측 한 번보다 무겁게 세는 배율이다.
+pub mod credits {
+    /// 마찰 폭발 · 재시도 · 접힌 취소 루프 없이 완주했지만 지름길 기준(z ≤ −band)에는 못 미친 무마찰 완주의 바닥값
+    pub const CLEAN_PASS_FLOOR: f64 = 0.65;
+    /// 고스트 안내 없이 스스로 찾아 완주한 지름길
+    pub const SELF_DISCOVERED: f64 = 1.00;
+    /// 고스트(러닝메이트) 배지를 그대로 따라 완주한 런 (확증 편향을 줄인다)
+    pub const GHOST_FOLLOWED: f64 = 0.35;
+    /// 표준 명령(AST · 명령줄)과 1:1 로 묶여 음성 이름 · 단일 키 호출이 검증된 접근성 체크포인트
+    pub const ACCESSIBLE_VERIFIED: f64 = 1.20;
+    /// 조건부로 되살린(FadedRecall) 옛 코스가 처음 마찰 없이 통과한 런: 빨리 회복시킨다
+    pub const PROVISIONAL_RECALL_PASS: f64 = 1.50;
+
+    /// 무마찰 완주의 몫: 스스로 찾았으면 [`CLEAN_PASS_FLOOR`], 고스트를 따랐으면 [`GHOST_FOLLOWED`]
+    pub fn clean_pass(ghost_followed: bool) -> f64 {
+        if ghost_followed {
+            GHOST_FOLLOWED
+        } else {
+            CLEAN_PASS_FLOOR
+        }
+    }
+
+    /// 지름길 완주의 몫: 스스로 찾았으면 [`SELF_DISCOVERED`], 고스트를 따랐으면 [`GHOST_FOLLOWED`]
+    pub fn shortcut(ghost_followed: bool) -> f64 {
+        if ghost_followed {
+            GHOST_FOLLOWED
+        } else {
+            SELF_DISCOVERED
+        }
+    }
+}
+
+/// [`effective_half_life_ms`] 의 조절 폭
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AdaptiveHalfLifeCfg {
+    /// 패치 드리프트로 보는 z (기본 2.0)
+    pub drift_z_trigger: f64,
+    /// 드리프트 때 줄일 수 있는 가장 짧은 반감기 (기본 2일)
+    pub min_drift_half_life_ms: f64,
+    /// 스코프 전체가 쉬는 동안(월간 · 분기 업무) 늘일 수 있는 가장 긴 반감기 (기본 45일)
+    pub max_dormant_half_life_ms: f64,
+}
+
+impl Default for AdaptiveHalfLifeCfg {
+    fn default() -> Self {
+        AdaptiveHalfLifeCfg {
+            drift_z_trigger: 2.0,
+            min_drift_half_life_ms: 2.0 * DAY_MS,
+            max_dormant_half_life_ms: 45.0 * DAY_MS,
+        }
+    }
+}
+
+/// 트래픽 · 드리프트에 맞춘 유효 반감기 `H_eff`.
+///
+/// 계약 경로(`verdict_v1` · `v2`)는 트랙의 `half_life_ms` 를 그대로 쓰고, 서버 nav_verdicts 스윕과 로컬 코칭이 골라 부른다.
+/// - 드리프트 `z ≥ drift_z_trigger`: `H × 1 / (1 + (z − trigger))`, 단 `min_drift_half_life_ms` 아래로는 줄이지 않는다
+///   (기본 반감기가 그보다 짧으면 기본값). 옛 코스를 빨리 내린다.
+/// - 그 밖: 스코프 활성 비율 `a`(0 = 완전 휴지 ~ 1 = 상시 활성)만큼 `H + (H_max − H)(1 − a)` 로 늘인다. 월간 업무의
+///   휴지기에 코스가 잊히지 않게 한다. 기본 반감기가 이미 `H_max` 이상이면(예: 90일 `pd` 트랙) 늘이지도 줄이지도 않는다.
+/// - 유한하지 않은 `z` 는 드리프트 없음, 유한하지 않은 `a` 는 상시 활성(조절 없음)으로 본다.
+pub fn effective_half_life_ms(
+    base_half_life_ms: f64,
+    drift_z: Option<f64>,
+    scope_activity_ratio: f64,
+    cfg: &AdaptiveHalfLifeCfg,
+) -> f64 {
+    if !base_half_life_ms.is_finite() || base_half_life_ms <= 0.0 {
+        return base_half_life_ms;
+    }
+    if let Some(dz) = drift_z.filter(|z| z.is_finite() && *z >= cfg.drift_z_trigger) {
+        let shrink = 1.0 / (1.0 + (dz - cfg.drift_z_trigger));
+        return (base_half_life_ms * shrink).max(cfg.min_drift_half_life_ms.min(base_half_life_ms));
+    }
+    let act = if scope_activity_ratio.is_finite() {
+        scope_activity_ratio.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let ceiling = cfg.max_dormant_half_life_ms.max(base_half_life_ms);
+    base_half_life_ms + (ceiling - base_half_life_ms) * (1.0 - act)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +658,55 @@ mod tests {
         let b = baseline_of(&[1.0, -1.0, 1.0, -1.0]);
         assert_eq!((b.n, b.mean, b.sd), (4, 0.0, 1.0));
         assert_eq!(baseline_of(&[]).n, 0);
+    }
+
+    #[test]
+    fn credits_split_self_found_and_ghost_followed_runs() {
+        use credits::*;
+        assert_eq!(clean_pass(false), CLEAN_PASS_FLOOR);
+        assert_eq!(clean_pass(true), GHOST_FOLLOWED);
+        assert_eq!(shortcut(false), SELF_DISCOVERED);
+        assert_eq!(shortcut(true), GHOST_FOLLOWED);
+        // 몫은 판정 수식을 바꾸지 않고 근거량만 바꾼다: 같은 관측 둘의 E 는 몫의 합
+        let params = Params::v2();
+        let track = params.track(NAV).unwrap();
+        let obs = |credit| Obs {
+            kind: IMPLICIT.into(),
+            sign: 1,
+            weight: params.weight(IMPLICIT),
+            credit,
+            at_ms: 0,
+        };
+        let (e, _) = evidence(&[obs(CLEAN_PASS_FLOOR), obs(GHOST_FOLLOWED)], 0, track, &params);
+        assert!((e - 0.3 * (0.65 + 0.35)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn effective_half_life_shrinks_on_drift_and_stretches_while_dormant() {
+        let cfg = AdaptiveHalfLifeCfg::default();
+        let day = DAY_MS;
+        let h = 14.0 * day;
+        // 상시 활성 · 드리프트 없음: 그대로
+        assert_eq!(effective_half_life_ms(h, None, 1.0, &cfg), h);
+        // 완전 휴지: 45일, 절반 활성: 그 사이
+        assert_eq!(effective_half_life_ms(h, None, 0.0, &cfg), 45.0 * day);
+        assert_eq!(effective_half_life_ms(h, None, 0.5, &cfg), 29.5 * day);
+        // 드리프트: 기준 z 에서는 그대로, z = 3 이면 절반, 아주 크면 2일에서 멈춤
+        assert_eq!(effective_half_life_ms(h, Some(2.0), 0.0, &cfg), h);
+        assert_eq!(effective_half_life_ms(h, Some(3.0), 1.0, &cfg), 7.0 * day);
+        assert_eq!(effective_half_life_ms(h, Some(50.0), 1.0, &cfg), 2.0 * day);
+        // 기준 z 아래 드리프트는 휴지 규칙을 따른다
+        assert_eq!(effective_half_life_ms(h, Some(1.9), 0.0, &cfg), 45.0 * day);
+        // 90일 트랙은 휴지기에 줄지 않는다 (45일 상한은 늘이는 폭일 뿐)
+        let pd = 90.0 * day;
+        assert_eq!(effective_half_life_ms(pd, None, 0.0, &cfg), pd);
+        assert!((effective_half_life_ms(pd, Some(4.0), 1.0, &cfg) - 30.0 * day).abs() < 1e-3);
+        // 2일보다 짧은 기본 반감기는 드리프트로 늘어나지 않는다
+        assert_eq!(effective_half_life_ms(day, Some(9.0), 1.0, &cfg), day);
+        // 유한하지 않은 입력
+        assert_eq!(effective_half_life_ms(h, Some(f64::NAN), f64::NAN, &cfg), h);
+        assert_eq!(effective_half_life_ms(h, None, -3.0, &cfg), 45.0 * day);
+        // 계약 트랙의 반감기는 그대로다 (계약 경로는 이 함수를 부르지 않는다)
+        assert_eq!(Params::v2().track(NAV).unwrap().half_life_ms, h);
     }
 }
