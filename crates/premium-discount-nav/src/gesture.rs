@@ -244,6 +244,12 @@ pub struct KinematicProfile {
     /// 최대 클릭 유지 시간 상한(ms).
     #[serde(default = "default_max_press_ms")]
     pub max_press_ms: i64,
+    /// 의도하지 않은 같은 키 반복(키 바운스)의 간격 분포(ms). 5개 미만이면 [`KEY_BOUNCE_MS`] 띠를 쓴다.
+    #[serde(default)]
+    pub key_bounce_ms: Moments,
+    /// 수식 키가 미끄러진 입력에서 지우기(Backspace)까지의 간격 분포(ms). 5개 미만이면 [`MODIFIER_SLIP_RECOVERY_MS`].
+    #[serde(default)]
+    pub modifier_slip_ms: Moments,
 }
 
 fn default_spastic_bounce_ms() -> i64 {
@@ -264,6 +270,8 @@ impl Default for KinematicProfile {
             spastic_bounce_ms: SPASTIC_BOUNCE_MS,
             max_slop_px: default_max_slop_px(),
             max_press_ms: default_max_press_ms(),
+            key_bounce_ms: Moments::default(),
+            modifier_slip_ms: Moments::default(),
         }
     }
 }
@@ -309,6 +317,93 @@ impl KinematicProfile {
         let eff = self.effective_params(base);
         BASE_HOLD_MS.max(eff.press_max_ms + HOLD_SHIFT_MARGIN_MS)
     }
+
+    /// 키 바운스 간격 하나를 기저선에 넣는다 (0 ~ 400 ms 만)
+    pub fn observe_key_bounce(&mut self, gap_ms: f64) {
+        if gap_ms.is_finite() && (0.0..=400.0).contains(&gap_ms) {
+            self.key_bounce_ms.push(gap_ms);
+        }
+    }
+
+    /// 수식 키 미끄럼에서 지우기까지의 간격 하나를 기저선에 넣는다 (0 ~ 1,500 ms 만)
+    pub fn observe_modifier_slip(&mut self, gap_ms: f64) {
+        if gap_ms.is_finite() && (0.0..=1_500.0).contains(&gap_ms) {
+            self.modifier_slip_ms.push(gap_ms);
+        }
+    }
+
+    /// 키 바운스로 보는 간격 띠 `(최소, 최대)` ms: 기저선이 5개 이상이면 평균 ± 2σ(40 ~ 250 ms 안), 아니면 [`KEY_BOUNCE_MS`]
+    pub fn key_bounce_band(&self) -> (i64, i64) {
+        if self.key_bounce_ms.n < 5 {
+            return (*KEY_BOUNCE_MS.start(), *KEY_BOUNCE_MS.end());
+        }
+        let (m, sd) = (self.key_bounce_ms.mean, self.key_bounce_ms.sample_sd());
+        let lo = (m - 2.0 * sd).round().clamp(40.0, 250.0) as i64;
+        let hi = (m + 2.0 * sd).round().clamp(40.0, 250.0) as i64;
+        (lo.min(hi), hi.max(lo))
+    }
+
+    /// 수식 키 미끄럼 뒤 지우기를 복구로 보는 시간 (ms): 기저선이 5개 이상이면 평균 + 2σ(1,500 ms 안), 아니면 기본값
+    pub fn modifier_slip_window_ms(&self) -> i64 {
+        if self.modifier_slip_ms.n < 5 {
+            return MODIFIER_SLIP_RECOVERY_MS;
+        }
+        (self.modifier_slip_ms.mean + 2.0 * self.modifier_slip_ms.sample_sd()).round().clamp(100.0, 1_500.0) as i64
+    }
+}
+
+/// 의도하지 않은 같은 키 반복으로 보는 기본 간격 띠 (ms)
+pub const KEY_BOUNCE_MS: std::ops::RangeInclusive<i64> = 80..=150;
+/// 수식 키 미끄럼 뒤 지우기 한 번을 복구로 보는 기본 시간 (ms)
+pub const MODIFIER_SLIP_RECOVERY_MS: i64 = 600;
+/// 지우기 키의 이름
+pub const BACKSPACE_KEY: &str = "Backspace";
+
+/// 키 누름 하나 (값이 아니라 키 이름만: 글자 키는 한 글자 이름, 기능 키는 "Enter" · "Backspace" …)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyPress {
+    pub t_ms: i64,
+    pub key: String,
+    /// 수식 키(Ctrl · Alt · Shift · Meta)를 함께 눌렀다
+    pub modified: bool,
+}
+
+/// 키 누름 하나의 판정
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyVerdict {
+    /// 의도한 입력
+    Keep,
+    /// 의도하지 않은 같은 키 반복: 다시 고침(Retried) 마찰로 세지 않는다 (sign 0)
+    Bounce,
+    /// 수식 키가 미끄러진 입력 바로 뒤의 지우기 한 번: 마찰로 세지 않는다 (sign 0)
+    SlipRecovery,
+}
+
+/// 운동 떨림 사용자의 키보드 바운스와 수식 키 미끄럼 복구를 가린다 (누름마다 판정, 같은 길이).
+///
+/// - 같은 키를 같은 수식 상태로 바운스 띠([`KinematicProfile::key_bounce_band`]) 안의 간격으로 다시 눌렀으면 [`KeyVerdict::Bounce`].
+/// - 수식 키와 함께 누른 글자 키 바로 뒤([`KinematicProfile::modifier_slip_window_ms`] 안)의 지우기 한 번(다음 누름이 또 지우기가
+///   아님)은 [`KeyVerdict::SlipRecovery`].
+pub fn filter_keyboard_bounces(presses: &[KeyPress], profile: &KinematicProfile) -> Vec<KeyVerdict> {
+    let (lo, hi) = profile.key_bounce_band();
+    let slip = profile.modifier_slip_window_ms();
+    let printable = |k: &KeyPress| k.key.chars().count() == 1;
+    (0..presses.len())
+        .map(|i| {
+            let cur = &presses[i];
+            let Some(prev) = i.checked_sub(1).map(|j| &presses[j]) else { return KeyVerdict::Keep };
+            let gap = cur.t_ms - prev.t_ms;
+            if cur.key == prev.key && cur.modified == prev.modified && (lo..=hi).contains(&gap) {
+                return KeyVerdict::Bounce;
+            }
+            let single = presses.get(i + 1).is_none_or(|next| next.key != BACKSPACE_KEY);
+            if cur.key == BACKSPACE_KEY && prev.modified && printable(prev) && (0..=slip).contains(&gap) && single {
+                return KeyVerdict::SlipRecovery;
+            }
+            KeyVerdict::Keep
+        })
+        .collect()
 }
 
 /// 개인 운동 기저선([`KinematicProfile`])을 적용한 획 분류. 손떨림·지연 해제가 있는 일반 클릭도 표준 [`Gesture::Press`] 로 수렴한다.
@@ -443,5 +538,44 @@ mod tests {
         // Genuine intentional rage clicks spaced >= 180ms apart still trigger RageClick.
         let genuine_rage = [(0, 50.0, 50.0), (200, 52.0, 51.0), (420, 51.0, 52.0)];
         assert!(rage_presses_adaptive(&genuine_rage, &base, &profile));
+    }
+
+    fn key(t_ms: i64, key: &str, modified: bool) -> KeyPress {
+        KeyPress { t_ms, key: key.into(), modified }
+    }
+
+    #[test]
+    fn keyboard_bounces_and_a_single_slip_recovery_are_exempt() {
+        let profile = KinematicProfile::default();
+        let presses = [
+            key(0, "Enter", false),
+            key(110, "Enter", false),    // 떨림으로 한 번 더 눌림 (110 ms)
+            key(900, "A", true),         // Shift 가 미끄러져 대문자
+            key(1_200, BACKSPACE_KEY, false),
+            key(1_500, "a", false),
+            key(2_400, "Enter", false),
+            key(2_700, "Enter", false),  // 300 ms: 의도한 두 번째 누름
+            key(3_000, "b", true),
+            key(3_200, BACKSPACE_KEY, false),
+            key(3_350, BACKSPACE_KEY, false), // 연속 지우기는 복구 한 번이 아니다
+        ];
+        let v = filter_keyboard_bounces(&presses, &profile);
+        use KeyVerdict::*;
+        assert_eq!(v, vec![Keep, Bounce, Keep, SlipRecovery, Keep, Keep, Keep, Keep, Keep, Bounce]);
+        // 기저선이 쌓이면 그 사람의 띠를 쓴다
+        let mut learned = KinematicProfile::default();
+        for g in [190.0, 200.0, 210.0, 205.0, 195.0] {
+            learned.observe_key_bounce(g);
+        }
+        let (lo, hi) = learned.key_bounce_band();
+        assert!(lo > 150 && hi < 250, "({lo}, {hi})");
+        assert_eq!(filter_keyboard_bounces(&[key(0, "x", false), key(200, "x", false)], &learned)[1], Bounce);
+        assert_eq!(filter_keyboard_bounces(&[key(0, "x", false), key(110, "x", false)], &learned)[1], Keep);
+        // 옛 프로필 JSON 은 새 칸 없이 읽힌다
+        let mut j = serde_json::to_value(KinematicProfile::default()).unwrap();
+        j.as_object_mut().unwrap().remove("key_bounce_ms");
+        j.as_object_mut().unwrap().remove("modifier_slip_ms");
+        let back: KinematicProfile = serde_json::from_value(j).unwrap();
+        assert_eq!(back.key_bounce_ms.n, 0);
     }
 }

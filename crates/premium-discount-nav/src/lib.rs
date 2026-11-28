@@ -20,15 +20,18 @@
 //! 모델(SigLIP2 · granite) · 저장소(LanceDB) · HTTP 에 의존하지 않는다. 벡터는 앱이 임베딩해서 넘긴다.
 
 mod behavior;
+mod credit;
 mod dom;
 mod gesture;
 mod hash;
 mod mark;
 mod navmap;
 mod order;
+mod portfolio;
 mod privacy;
 mod region;
 mod resume;
+mod speech;
 mod trial;
 
 pub use behavior::{
@@ -36,10 +39,15 @@ pub use behavior::{
     LiveParams, LiveProbeContext, Signal, UniversalChoiceBook, UniversalChoiceEntry, UniversalChoiceKind, Welford, CROSS_BOUNDARY_BOUNCE_WINDOW_MS, CROSS_BOUNDARY_HOP_DECAY, IDLE_AFK_CUTOFF_MS,
     PRIVACY_PURGE_MS, READING_MS_PER_CHAR,
 };
+pub use credit::{
+    accept_window_ms, listening_adjusted_ms, run_credit, step_fault_mask, InputSurfaceRole, RunCredit, StepOutcome, ACCEPT_WINDOW_MS, BOTTLENECK_Z, NOOP_CLICK_FAULT,
+    SCREEN_READER_ACCEPT_WINDOW_MS,
+};
 pub use dom::{selector_template, DomNode, SELECTOR_DEPTH};
 pub use gesture::{
-    classify_stroke, classify_stroke_adaptive, filter_spastic_bounces, rage_presses, rage_presses_adaptive, scroll_bursts, Gesture, GestureParams, KinematicProfile, PointerKind, PointerSample,
-    ScrollBurst, ScrollSample, Stroke, BASE_HOLD_MS, HOLD_SHIFT_MARGIN_MS, SPASTIC_BOUNCE_MS,
+    classify_stroke, classify_stroke_adaptive, filter_keyboard_bounces, filter_spastic_bounces, rage_presses, rage_presses_adaptive, scroll_bursts, Gesture, GestureParams, KeyPress,
+    KeyVerdict, KinematicProfile, PointerKind, PointerSample, ScrollBurst, ScrollSample, Stroke, BACKSPACE_KEY, BASE_HOLD_MS, HOLD_SHIFT_MARGIN_MS, KEY_BOUNCE_MS,
+    MODIFIER_SLIP_RECOVERY_MS, SPASTIC_BOUNCE_MS,
 };
 pub use hash::{app_hash, element_hash, hash_id, hash_message, page_hash, region_hash, screen_hash, structure_template, url_template};
 pub use mark::{
@@ -48,12 +56,20 @@ pub use mark::{
 };
 pub use navmap::{MapRegion, NavMap, NAVMAP_SCHEMA};
 pub use order::{grid_subrect, number, FrameContext, Numbered, SlotOrigin, StickyConfig, StickyNumberer, MAX_NUMBERED};
-pub use privacy::{evaluate_privacy, privacy_triggers, scrub_anchor, scrub_name, split_pin_fields, virtual_keypad, PrivacyProbeInput, PrivacyShield, PrivacyTrigger, NAME_MAX_CHARS};
+pub use portfolio::{
+    is_course_superseded_preserving_traits, scrub_workspace_identity, select_stratified_portfolio, PaceScale, PortfolioCourse, BRANCH_TOKEN, PATH_TOKEN, PER_GOAL_CAP,
+    PROTECTED_ACCESSIBLE_TRAITS, QUOTA_ACCESSIBLE, QUOTA_ELITE, QUOTA_ENTRY, QUOTA_POPULAR, TIME_TOKEN, VERSION_TOKEN,
+};
+pub use privacy::{
+    evaluate_privacy, evaluate_privacy_inline, privacy_triggers, scrub_anchor, scrub_name, split_pin_fields, virtual_keypad, InlineRedactionZone, PrivacyProbeInput, PrivacyShield,
+    PrivacyTrigger, RedactionKind, NAME_MAX_CHARS,
+};
 pub use region::{merge, merge_absorbing, sensitive_screen, Rect, Region, Role, Source, CONTAIN_ABSORB, MERGE_IOU};
 pub use resume::{
-    frozen_overlap_ms, merge_frozen_spans, payment_route, receipt_finish_page, receipt_route, PrivacyPhase, PrivacyStateMachine, ResumeStepOutcome, SurfaceSignature, ZeroPixelProbe, BRIDGE_TTL_MS,
-    GRACE_MS, GRACE_TICKS, POST_PAYMENT_ARM_MS,
+    frozen_overlap_ms, merge_frozen_spans, payment_route, receipt_finish_page, receipt_route, PrivacyPhase, PrivacyStateMachine, PrivacyTransitionCue, ResumeStepOutcome, StepContext,
+    SurfaceSignature, ZeroPixelProbe, BRIDGE_TTL_MS, GRACE_MS, GRACE_TICKS, POST_PAYMENT_ARM_MS,
 };
+pub use speech::{CoalesceOutcome, SpeechChunkMerger, SpeechCoalescer, SPEECH_COALESCE_WINDOW_MS};
 pub use trial::{
     checkpoint_id, compute_interaction_traits, contextual_ghost_utility, course_chain, course_hash, dead_end_mark_if_eligible, ghost_utility, ghost_utility_v3, is_course_superseded,
     reduce_course_points, route_marks, route_marks_v2, selection_gesture, shortcut_wins, shortcut_wins_v2, tier, AbandonContext, AccessibilityRoutePrefs, Added, Checkpoint, CheckpointTally,

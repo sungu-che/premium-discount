@@ -631,11 +631,7 @@ pub fn route_marks_v2(run: &[StepRef], ghost: &[StepRef], ctx: &RouteEvalContext
     if run.first()? != ghost.first()? || run.last()? != ghost.last()? {
         return None;
     }
-    let pace_ratio = if ctx.user_pace_ratio.is_finite() && ctx.user_pace_ratio >= 1.0 {
-        ctx.user_pace_ratio
-    } else {
-        1.0
-    };
+    let pace_ratio = crate::portfolio::PaceScale::from_rho_u(ctx.user_pace_ratio).get();
     let norm_total = ctx.run_total_ms as f64 / pace_ratio;
     let avg = ctx.ghost_avg_ms as f64;
     let pace_ceiling = (avg * (1.0 + ctx.pace_eps.max(0.0))).max(avg + ctx.pace_deadband_ms as f64);
@@ -1079,11 +1075,7 @@ pub fn shortcut_wins_v2(run: &Run, ghost: &PublicCourse, fault_steps_mask: u16, 
     {
         return Vec::new();
     }
-    let pace_ratio = if user_pace_ratio.is_finite() && user_pace_ratio >= 1.0 {
-        user_pace_ratio
-    } else {
-        1.0
-    };
+    let pace_ratio = crate::portfolio::PaceScale::from_rho_u(user_pace_ratio).get();
     let mut out = Vec::new();
     for w in common_steps(&refs, &ghost.steps).windows(2) {
         let ((i0, j0), (i1, j1)) = (w[0], w[1]);

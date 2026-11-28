@@ -223,6 +223,42 @@ pub fn privacy_triggers(input: &PrivacyProbeInput<'_>) -> Vec<PrivacyTrigger> {
     .collect()
 }
 
+/// 화면 일부만 가리는 영역의 종류
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedactionKind {
+    /// OS 알림 토스트
+    OsNotificationToast,
+    /// 터미널 · 편집기 안의 비밀 한 줄 (키 · 토큰 · 환경 변수 값)
+    InlineSecretLine,
+    /// 문서 · 표 안의 민감한 칸 하나 (고유 식별 정보 · 급여 · 진단 …)
+    SensitiveDocumentCell,
+}
+
+/// 화면 일부만 가리는 영역 (창 기준 0 ~ 1). 무엇이 비밀인지는 부르는 쪽이 판정해 넘긴다
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct InlineRedactionZone {
+    pub rect: Rect,
+    pub kind: RedactionKind,
+}
+
+/// [`evaluate_privacy`] 에 인라인 가림 영역을 더한 판정: 인라인 영역과 겹친 후보는 트리 · 키패드 · 시드 구문 판정에서 빼고(비밀
+/// 한 줄 · 민감한 칸 하나로 창 전체를 잠그지 않는다), 그 영역을 토스트와 함께 가린다. 창 · 시드 구문(제목) · 비전 신호의 잠금은
+/// 그대로다. 영역이 없으면 [`evaluate_privacy`] 와 같다
+pub fn evaluate_privacy_inline(input: &PrivacyProbeInput<'_>, inline: &[InlineRedactionZone]) -> PrivacyShield {
+    if inline.is_empty() {
+        return evaluate_privacy(input);
+    }
+    let outside: Vec<Region> = input.regions.iter().filter(|r| !inline.iter().any(|z| overlaps(&z.rect, &r.rect))).cloned().collect();
+    let narrowed = PrivacyProbeInput { regions: &outside, ..*input };
+    if let Some(trigger) = privacy_triggers(&narrowed).first() {
+        return PrivacyShield::FullLockdown(*trigger);
+    }
+    let mut zones: Vec<Rect> = input.os_notification_zones.to_vec();
+    zones.extend(inline.iter().map(|z| z.rect));
+    PrivacyShield::PartialRedaction { zones }
+}
+
 /// 여러 층의 신호를 합쳐 판정한다: 잠금 사유가 하나라도 있으면 전체 잠금(앞선 사유), 알림 토스트만 있으면 그 영역만 가림,
 /// 아니면 그대로 둠. [`crate::sensitive_screen`] 과 [`crate::merge`] 는 이 판정과 따로 지금처럼 동작한다
 pub fn evaluate_privacy(input: &PrivacyProbeInput<'_>) -> PrivacyShield {
@@ -537,6 +573,29 @@ mod tests {
     }
 
     const BAG: [&str; 12] = ["포션", "검", "방패", "활", "화살", "갑옷", "투구", "반지", "목걸이", "망토", "장화", "열쇠"];
+
+    #[test]
+    fn an_inline_secret_line_is_redacted_without_locking_the_window() {
+        // 터미널: 명령 줄 세 개와 비밀 값 줄 하나 (트리가 그 줄을 민감 칸으로 표시)
+        let mut lines: Vec<Region> = (0..3).map(|i| region(&format!("term>line:{i}"), Role::Text, "", (0.02, 0.10 + i as f32 * 0.05, 0.9, 0.04), Source::Tree)).collect();
+        let mut secret = region("term>line:3", Role::Text, "", (0.02, 0.25, 0.9, 0.04), Source::Tree);
+        secret.sensitive = true;
+        lines.push(secret);
+        let plain = PrivacyProbeInput { regions: &lines, ..Default::default() };
+        assert_eq!(evaluate_privacy(&plain), PrivacyShield::FullLockdown(PrivacyTrigger::TreeSensitiveField), "before: the whole window");
+        let zone = [InlineRedactionZone { rect: Rect::new(0.0, 0.245, 1.0, 0.05).unwrap(), kind: RedactionKind::InlineSecretLine }];
+        let shield = evaluate_privacy_inline(&plain, &zone);
+        assert!(shield.record(), "the rest of the terminal keeps recording");
+        assert_eq!(shield, PrivacyShield::PartialRedaction { zones: vec![zone[0].rect] });
+        let kept = shield.redact(lines.clone());
+        assert_eq!(kept.len(), 3, "only the secret line is dropped");
+        assert!(kept.iter().all(|r| !r.sensitive));
+        // 창 단위 신호는 여전히 전체를 잠그고, 영역이 없으면 예전 판정과 같다
+        let protected = PrivacyProbeInput { os_capture_protected: true, ..plain };
+        assert_eq!(evaluate_privacy_inline(&protected, &zone).trigger(), Some(PrivacyTrigger::DisplayAffinityProtected));
+        assert_eq!(evaluate_privacy_inline(&plain, &[]), evaluate_privacy(&plain));
+        assert_eq!(serde_json::to_value(RedactionKind::SensitiveDocumentCell).unwrap(), "sensitive_document_cell");
+    }
 
     #[test]
     fn ps01_a_tree_marked_password_field_locks_the_whole_screen() {

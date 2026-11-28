@@ -22,6 +22,7 @@ use std::hash::BuildHasher;
 use std::sync::OnceLock;
 
 use crate::hash::{page_hash, url_template};
+use crate::portfolio::PaceScale;
 use crate::privacy::PrivacyTrigger;
 
 /// 유예: 민감 신호가 사라진 뒤 이만큼 깨끗해야 푼다
@@ -137,6 +138,40 @@ pub struct ResumeStepOutcome {
     pub bridge_broken: bool,
 }
 
+/// 잠금이 바뀔 때 들려주는 신호 (기록하지 않는 정적 효과음: 화면을 보지 않는 사용자가 잠김 · 풀림을 안다)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyTransitionCue {
+    #[default]
+    None,
+    EnteredLockdown,
+    ResumedNormal,
+}
+
+impl ResumeStepOutcome {
+    /// 이번 확인의 신호: 캡처를 멈췄으면 잠김, 다시 시작했으면 풀림
+    pub fn cue(&self) -> PrivacyTransitionCue {
+        if self.privacy_epoch_started {
+            PrivacyTransitionCue::EnteredLockdown
+        } else if self.trigger_sensor_reprime {
+            PrivacyTransitionCue::ResumedNormal
+        } else {
+            PrivacyTransitionCue::None
+        }
+    }
+}
+
+/// [`PrivacyStateMachine::step_with`] 이 [`ZeroPixelProbe`] 밖에서 더 보는 것. 기본값이면 [`PrivacyStateMachine::step`] 과 같다
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StepContext {
+    /// 인증 · 결제 문맥 (로그인 2단계 · 결제 인증). 잠금이 결제 문맥이 아니어도 이것이면 인증 잠금으로 본다
+    pub auth_context: bool,
+    /// 앞에 있는 창이 인증 앱(OTP · 패스키)이다. 판정은 부르는 쪽이 한다
+    pub authenticator_surface: bool,
+    /// 기기 안 개인 속도 배율: 다리 유지 시간([`BRIDGE_TTL_MS`])을 이만큼 늘린다
+    pub pace: Option<PaceScale>,
+}
+
 /// 개인정보 잠금 · 안전 복귀 상태 머신 (모듈 설명 참고)
 #[derive(Debug, Clone)]
 pub struct PrivacyStateMachine {
@@ -155,6 +190,10 @@ pub struct PrivacyStateMachine {
     bridge: Option<(String, i64)>,
     frozen_spans: Vec<(i64, i64)>,
     frozen_since: Option<i64>,
+    /// 이번 확인에 쓰는 다리 유지 시간 (`bridge_ttl_ms` × 개인 속도)
+    active_ttl_ms: i64,
+    /// 지난 확인의 시각 (인증 앱에 있던 시간만큼 다리 시계를 멈춘다)
+    last_step_ms: Option<i64>,
 }
 
 impl Default for PrivacyStateMachine {
@@ -171,6 +210,8 @@ impl Default for PrivacyStateMachine {
             bridge: None,
             frozen_spans: Vec::new(),
             frozen_since: None,
+            active_ttl_ms: BRIDGE_TTL_MS,
+            last_step_ms: None,
         }
     }
 }
@@ -187,9 +228,36 @@ impl PrivacyStateMachine {
 
     /// 확인 한 번으로 상태를 옮긴다. 캡처하기 전에 부른다 (잠금 · 유예 · 영수증 보호 중에는 500 ms 마다)
     pub fn step(&mut self, probe: &ZeroPixelProbe) -> ResumeStepOutcome {
+        self.step_with(probe, &StepContext::default())
+    }
+
+    /// [`step`](Self::step) 에 문맥을 더한 것. 인증 잠금(결제 문맥이거나 `auth_context`) 중에 앞 창이 인증 앱이면 같은 인증의
+    /// OTP · 패스키 단계로 본다: 상태를 그대로 두고(캡처 · 기록 없음, 유예를 세지 않음) 그동안 다리 시계를 멈춘다. 그래서 원래
+    /// 앱으로 돌아와 풀리면 잠금 전 체크포인트가 이어진다(`bridge_broken == false`). 다리 유지 시간은 개인 속도만큼 늘린다
+    pub fn step_with(&mut self, probe: &ZeroPixelProbe, cx: &StepContext) -> ResumeStepOutcome {
+        self.active_ttl_ms = cx.pace.unwrap_or(PaceScale::NEUTRAL).scale_ttl_ms(self.bridge_ttl_ms);
+        let elapsed = self.last_step_ms.map_or(0, |last| (probe.now_ms - last).max(0));
+        self.last_step_ms = Some(probe.now_ms);
+        let auth_lock = match &self.phase {
+            PrivacyPhase::Locked { had_payment_context, .. } | PrivacyPhase::GraceProbe { had_payment_context, .. } => *had_payment_context || cx.auth_context,
+            _ => false,
+        };
+        if auth_lock && cx.authenticator_surface {
+            if let Some((_, since)) = self.bridge.as_mut() {
+                *since += elapsed;
+            }
+            if let PrivacyPhase::GraceProbe { clear_since_ms, .. } = &mut self.phase {
+                *clear_since_ms += elapsed;
+            }
+            return ResumeStepOutcome::default();
+        }
+        self.step_inner(probe)
+    }
+
+    fn step_inner(&mut self, probe: &ZeroPixelProbe) -> ResumeStepOutcome {
         let now = probe.now_ms;
         let mut out = ResumeStepOutcome::default();
-        if self.bridge.as_ref().is_some_and(|(_, since)| now - since > self.bridge_ttl_ms) {
+        if self.bridge.as_ref().is_some_and(|(_, since)| now - since > self.active_ttl_ms) {
             self.bridge = None;
             out.bridge_broken = true;
         }
@@ -379,7 +447,7 @@ impl PrivacyStateMachine {
     fn settle_bridge(&mut self, probe: &ZeroPixelProbe, out: &mut ResumeStepOutcome) {
         if let Some((cc, since)) = self.bridge.take() {
             let moved = !cc.is_empty() && !probe.active_cc.is_empty() && !cc.eq_ignore_ascii_case(&probe.active_cc);
-            out.bridge_broken |= moved || probe.now_ms - since > self.bridge_ttl_ms;
+            out.bridge_broken |= moved || probe.now_ms - since > self.active_ttl_ms;
         }
     }
 
@@ -721,5 +789,54 @@ mod tests {
         assert_eq!(receipt_finish_page("https://shop.example/cart"), None);
         assert_ne!(SurfaceSignature::new(1, "a"), SurfaceSignature::new(1, "b"));
         assert_eq!(SurfaceSignature::new(1, " a "), SurfaceSignature::new(1, "a"));
+    }
+
+    #[test]
+    fn an_authenticator_detour_during_an_auth_lock_keeps_the_bridge() {
+        let bank = SurfaceSignature::new(0x2001, "bank.example/login");
+        let otp = SurfaceSignature::new(0x3001, "authenticator");
+        let at = |t: i64, cc: &str, surface: SurfaceSignature, trigger: Option<PrivacyTrigger>| ZeroPixelProbe {
+            active_cc: cc.into(),
+            in_payment_flow: true,
+            ..probe(t, surface, trigger)
+        };
+        // 로그인 화면에서 보안 키패드로 잠긴 뒤 OTP 앱으로 가서 40초 머물고 돌아와 푼다
+        // (다리가 끊겼나, OTP 화면에서 캡처한 확인 수)
+        let script = |m: &mut PrivacyStateMachine, cx_otp: StepContext| -> (bool, usize) {
+            let mut broken = false;
+            let mut captured_otp = 0usize;
+            let mut lock = |m: &mut PrivacyStateMachine, t, cc: &str, s, trig, cx: &StepContext| {
+                let out = m.step_with(&at(t, cc, s, trig), cx);
+                broken |= out.bridge_broken;
+                out
+            };
+            let first = lock(m, 0, "bank.example", bank, Some(PrivacyTrigger::VirtualSecurityKeypad), &StepContext::default());
+            assert_eq!(first.cue(), PrivacyTransitionCue::EnteredLockdown);
+            for t in (500..=40_000).step_by(500) {
+                let out = lock(m, t, "authenticator.app", otp, None, &cx_otp);
+                captured_otp += usize::from(out.capture_and_record_allowed);
+            }
+            for t in (40_500..=60_000).step_by(500) {
+                let out = lock(m, t, "bank.example", bank, None, &StepContext::default());
+                if out.trigger_sensor_reprime {
+                    assert_eq!(out.cue(), PrivacyTransitionCue::ResumedNormal);
+                }
+            }
+            (broken, captured_otp)
+        };
+        // before (no context): the grace ran out in the authenticator app, so the lock settled there (the bridge broke) and the
+        // code screen was captured
+        let (broken, captured) = script(&mut PrivacyStateMachine::new(), StepContext::default());
+        assert!(broken && captured > 0, "{broken} {captured}");
+        // after: the authenticator step of the same sign-in keeps the lock and pauses the bridge clock
+        let otp_cx = StepContext { authenticator_surface: true, ..StepContext::default() };
+        let mut m = PrivacyStateMachine::new();
+        assert_eq!(script(&mut m, otp_cx), (false, 0));
+        // a personal pace stretches the bridge TTL
+        let mut m = PrivacyStateMachine::new();
+        let slow = StepContext { pace: Some(PaceScale::from_rho_u(2.0)), ..StepContext::default() };
+        m.step_with(&at(0, "bank.example", bank, Some(PrivacyTrigger::VirtualSecurityKeypad)), &slow);
+        let out = m.step_with(&at(BRIDGE_TTL_MS + 1_000, "bank.example", bank, Some(PrivacyTrigger::VirtualSecurityKeypad)), &slow);
+        assert!(!out.bridge_broken, "ρ_u = 2 doubles the 15-minute bridge");
     }
 }
