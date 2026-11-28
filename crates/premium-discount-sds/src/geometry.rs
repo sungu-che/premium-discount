@@ -194,6 +194,62 @@ pub fn classify_burst(prev_r: f32, cur_r: f32, min_delta: f32) -> FlowDirection 
     }
 }
 
+/// Screen kind: how the reader of a screen treats what it saw. Vision, dictionaries and coaching share the value
+/// (model-free, so a host can use it without linking any vision crate).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VisionKind {
+    /// What the screen is (a fight, a chart, code …): react when it changes, rarely afterwards.
+    Scene,
+    /// A moment (a win, a game over, a loading screen): react each time, short cooldown.
+    Event,
+    /// A private screen: no reaction, no speech, and the watcher steps back.
+    Privacy,
+}
+
+impl VisionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VisionKind::Scene => "scene",
+            VisionKind::Event => "event",
+            VisionKind::Privacy => "privacy",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<VisionKind, String> {
+        Ok(match s {
+            "scene" => VisionKind::Scene,
+            "event" => VisionKind::Event,
+            "privacy" => VisionKind::Privacy,
+            _ => return Err(format!("unknown vision kind '{s}' (scene, event, privacy)")),
+        })
+    }
+
+    /// Seconds before the same domain may be reacted to again (when a node sets no `cooldown_s`).
+    pub fn default_cooldown_s(self) -> u32 {
+        match self {
+            VisionKind::Scene => 600,
+            VisionKind::Event => 20,
+            VisionKind::Privacy => 60,
+        }
+    }
+}
+
+#[cfg(test)]
+mod vision_kind_tests {
+    use super::*;
+
+    #[test]
+    fn vision_kinds_round_trip_their_names() {
+        for k in [VisionKind::Scene, VisionKind::Event, VisionKind::Privacy] {
+            assert_eq!(VisionKind::parse(k.as_str()), Ok(k));
+            assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
+        }
+        assert!(VisionKind::parse("other").is_err());
+        assert_eq!(VisionKind::Privacy.default_cooldown_s(), 60);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
